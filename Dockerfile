@@ -1,5 +1,5 @@
-# Use GDAL-ready base image (Ubuntu + GDAL pre-installed)
-FROM ghcr.io/osgeo/gdal:ubuntu-small-3.9.3
+# Use FULL GDAL image for maximum format support (DGN V7, DGN V8, DXF, DWG...)
+FROM ghcr.io/osgeo/gdal:ubuntu-full-3.9.3
 
 # Install Python and pip
 RUN apt-get update && \

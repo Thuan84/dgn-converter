@@ -252,8 +252,9 @@ async def convert_dgn(
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
-    if not file.filename.lower().endswith(".dgn"):
-        raise HTTPException(400, "Only .dgn files are accepted")
+    allowed_ext = (".dgn", ".dxf")
+    if not file.filename.lower().endswith(allowed_ext):
+        raise HTTPException(400, f"Only {', '.join(allowed_ext)} files are accepted")
 
     # Read file content
     content = await file.read()
@@ -263,9 +264,10 @@ async def convert_dgn(
     if len(content) == 0:
         raise HTTPException(400, "Empty file")
 
-    # Save to temp file
+    # Save to temp file (keep original extension for driver auto-detection)
+    file_ext = os.path.splitext(file.filename)[1].lower()
     tmp_dir = tempfile.mkdtemp()
-    input_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.dgn")
+    input_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}{file_ext}")
 
     try:
         with open(input_path, "wb") as f:
