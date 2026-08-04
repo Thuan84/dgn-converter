@@ -123,15 +123,6 @@ def _postprocess_kml(kml_content: str) -> str:
         1,
     )
 
-    # Point Placemarks with just a name like "17" are DGN text annotations - remove them
-    kml_content = re.sub(
-        r'<Placemark>\s*<name>\d{1,4}</name>\s*<Style>.*?</Style>\s*'
-        r'<Point>.*?</Point>\s*</Placemark>',
-        '',
-        kml_content,
-        flags=re.DOTALL,
-    )
-
     logger.info("KML post-processing: removed opaque fills, added outline style")
     return kml_content
 
@@ -350,16 +341,8 @@ def convert_dgn_to_format(
             if geom is not None:
                 geom_type = geom.GetGeometryType()
 
-                # Point features: keep only if they have meaningful text (not just numbers)
-                if geom_type in POINT_TYPES:
-                    text_val = feature.GetField("Text") if feature.GetFieldIndex("Text") >= 0 else None
-                    if text_val is None:
-                        text_val = feature.GetField("Name") if feature.GetFieldIndex("Name") >= 0 else None
-                    # Skip if text is empty, purely numeric, or very short number
-                    if not text_val or re.match(r'^\s*\d{1,5}\s*$', str(text_val)):
-                        skipped += 1
-                        feature = src_layer.GetNextFeature()
-                        continue
+                # Point features are text annotations in DGN (plot numbers, areas, land codes)
+                # Keep ALL of them — they are meaningful cadastral labels
 
                 if coord_transform:
                     geom.Transform(coord_transform)
