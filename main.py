@@ -195,19 +195,41 @@ def convert_dgn_to_format(
     Returns:
         Converted file content as bytes
     """
-    # Try to open DGN with explicit drivers
+    # Try to open with explicit drivers
     src_ds = None
     tried_drivers = []
+    file_ext = os.path.splitext(input_path)[1].lower()
 
-    # Try DGN V8 driver first (MicroStation V8+)
-    for driver_name_try in ["DGNV8", "DGN"]:
-        drv = ogr.GetDriverByName(driver_name_try)
-        if drv is not None:
-            tried_drivers.append(driver_name_try)
+    if file_ext in ('.dgn',):
+        # Check DGN file format by reading magic bytes
+        file_format_info = ""
+        try:
+            with open(input_path, "rb") as f:
+                header = f.read(16)
+            if len(header) >= 4:
+                # DGN V8 files start with OLE2 container: D0 CF 11 E0
+                if header[:4] == b'\xd0\xcf\x11\xe0':
+                    file_format_info = "DGN V8 (OLE2 container detected)"
+                else:
+                    file_format_info = f"DGN V7 (header: {header[:8].hex()})"
+            logger.info(f"File format detection: {file_format_info}")
+        except Exception as e:
+            logger.warning(f"Could not read file header: {e}")
+
+        # Try DGN V8 driver first, then V7
+        for driver_name_try in ["DGNV8", "DGN"]:
+            drv = ogr.GetDriverByName(driver_name_try)
+            if drv is not None:
+                tried_drivers.append(driver_name_try)
+                src_ds = drv.Open(input_path, 0)
+                if src_ds is not None:
+                    logger.info(f"Opened with driver: {driver_name_try}")
+                    break
+    elif file_ext in ('.dxf',):
+        drv = ogr.GetDriverByName("DXF")
+        if drv:
+            tried_drivers.append("DXF")
             src_ds = drv.Open(input_path, 0)
-            if src_ds is not None:
-                logger.info(f"Opened DGN with driver: {driver_name_try}")
-                break
 
     # Fallback: let OGR auto-detect
     if src_ds is None:
@@ -216,9 +238,11 @@ def convert_dgn_to_format(
 
     if src_ds is None:
         available = ", ".join(tried_drivers)
+        # Include file format detection in error
+        fmt_msg = f" Detected format: {file_format_info}." if file_ext == '.dgn' and file_format_info else ""
         raise ValueError(
-            f"Cannot open DGN file. Tried drivers: [{available}]. "
-            f"The file may be DGN V8 format (requires Teigha/ODA libraries) or corrupted."
+            f"Cannot open file.{fmt_msg} Tried drivers: [{available}]. "
+            f"If DGN V8, please export to .dxf from MicroStation first."
         )
 
     layer_count = src_ds.GetLayerCount()
