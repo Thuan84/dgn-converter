@@ -1,0 +1,290 @@
+"""
+DGN to KML Converter API
+FastAPI server that converts MicroStation DGN files to KML/GeoJSON
+using GDAL/OGR library.
+
+Deployed on Render.com (Free Tier).
+"""
+
+import os
+import uuid
+import tempfile
+import logging
+from fastapi import FastAPI, UploadFile, File, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from osgeo import ogr, osr
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(
+    title="DGN Converter API",
+    description="Convert MicroStation DGN files to KML/GeoJSON for web map viewing",
+    version="1.0.0",
+)
+
+# CORS - allow frontend to call this API
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Max file size: 15MB
+MAX_FILE_SIZE = 15 * 1024 * 1024
+
+
+@app.get("/")
+def health_check():
+    """Health check endpoint - also keeps Render from sleeping."""
+    return {"status": "ok", "service": "dgn-converter"}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+def detect_source_srs(datasource) -> osr.SpatialReference | None:
+    """Try to detect the spatial reference from the DGN file."""
+    layer = datasource.GetLayer(0)
+    if layer is None:
+        return None
+
+    srs = layer.GetSpatialRef()
+    if srs:
+        return srs
+
+    # If no SRS found, return None (caller will handle default)
+    return None
+
+
+def convert_dgn_to_format(
+    input_path: str,
+    output_format: str = "KML",
+    source_epsg: int | None = None,
+) -> bytes:
+    """
+    Convert a DGN file to KML or GeoJSON using OGR.
+
+    Args:
+        input_path: Path to input .dgn file
+        output_format: 'KML' or 'GeoJSON'
+        source_epsg: EPSG code of source coordinate system (e.g., 9210 for VN2000)
+
+    Returns:
+        Converted file content as bytes
+    """
+    # Open source DGN
+    src_ds = ogr.Open(input_path, 0)
+    if src_ds is None:
+        raise ValueError("Cannot open DGN file. File may be corrupted or not a valid DGN.")
+
+    layer_count = src_ds.GetLayerCount()
+    if layer_count == 0:
+        raise ValueError("DGN file contains no layers.")
+
+    logger.info(f"DGN file has {layer_count} layer(s)")
+
+    # Determine output driver and extension
+    if output_format.upper() == "KML":
+        driver_name = "KML"
+        ext = ".kml"
+    elif output_format.upper() == "GEOJSON":
+        driver_name = "GeoJSON"
+        ext = ".geojson"
+    else:
+        raise ValueError(f"Unsupported output format: {output_format}")
+
+    out_driver = ogr.GetDriverByName(driver_name)
+    if out_driver is None:
+        raise RuntimeError(f"OGR driver '{driver_name}' not available")
+
+    # Create output file
+    output_path = input_path.replace(".dgn", ext)
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    out_ds = out_driver.CreateDataSource(output_path)
+    if out_ds is None:
+        raise RuntimeError("Failed to create output datasource")
+
+    # Setup coordinate transformation
+    target_srs = osr.SpatialReference()
+    target_srs.ImportFromEPSG(4326)  # WGS84 (what KML/web maps use)
+    target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+
+    coord_transform = None
+    if source_epsg:
+        source_srs = osr.SpatialReference()
+        source_srs.ImportFromEPSG(source_epsg)
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        coord_transform = osr.CoordinateTransformation(source_srs, target_srs)
+    else:
+        # Try to detect from file
+        detected_srs = detect_source_srs(src_ds)
+        if detected_srs:
+            detected_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+            coord_transform = osr.CoordinateTransformation(detected_srs, target_srs)
+
+    total_features = 0
+
+    for i in range(layer_count):
+        src_layer = src_ds.GetLayer(i)
+        if src_layer is None:
+            continue
+
+        layer_name = src_layer.GetName() or f"Layer_{i}"
+        feature_count = src_layer.GetFeatureCount()
+        logger.info(f"Processing layer '{layer_name}' with {feature_count} features")
+
+        # Create output layer
+        out_layer = out_ds.CreateLayer(
+            layer_name,
+            srs=target_srs,
+            geom_type=src_layer.GetGeomType(),
+        )
+
+        # Copy field definitions
+        src_defn = src_layer.GetLayerDefn()
+        for j in range(src_defn.GetFieldCount()):
+            field_defn = src_defn.GetFieldDefn(j)
+            out_layer.CreateField(field_defn)
+
+        # Copy features
+        src_layer.ResetReading()
+        feature = src_layer.GetNextFeature()
+        while feature is not None:
+            geom = feature.GetGeometryRef()
+            if geom is not None:
+                if coord_transform:
+                    geom.Transform(coord_transform)
+
+                out_feature = ogr.Feature(out_layer.GetLayerDefn())
+                out_feature.SetGeometry(geom)
+
+                # Copy field values
+                for j in range(feature.GetFieldCount()):
+                    try:
+                        out_feature.SetField(j, feature.GetField(j))
+                    except Exception:
+                        pass
+
+                out_layer.CreateFeature(out_feature)
+                total_features += 1
+
+            feature = src_layer.GetNextFeature()
+
+    # Cleanup
+    out_ds = None
+    src_ds = None
+
+    logger.info(f"Converted {total_features} features total")
+
+    if total_features == 0:
+        raise ValueError("No geometry features found in DGN file.")
+
+    # Read output
+    with open(output_path, "rb") as f:
+        content = f.read()
+
+    # Cleanup temp output
+    try:
+        os.remove(output_path)
+    except Exception:
+        pass
+
+    return content
+
+
+@app.post("/convert")
+async def convert_dgn(
+    file: UploadFile = File(..., description="DGN file to convert"),
+    format: str = Query("KML", description="Output format: KML or GeoJSON"),
+    source_epsg: int | None = Query(None, description="Source EPSG code (e.g., 9210 for VN2000 Mui 6)"),
+):
+    """
+    Convert a DGN file to KML or GeoJSON.
+
+    - Upload a .dgn file
+    - Optionally specify the source coordinate system (EPSG code)
+    - Returns the converted KML or GeoJSON file
+    """
+    # Validate file extension
+    if not file.filename:
+        raise HTTPException(400, "No filename provided")
+
+    if not file.filename.lower().endswith(".dgn"):
+        raise HTTPException(400, "Only .dgn files are accepted")
+
+    # Read file content
+    content = await file.read()
+    if len(content) > MAX_FILE_SIZE:
+        raise HTTPException(413, f"File too large. Max size: {MAX_FILE_SIZE // (1024*1024)}MB")
+
+    if len(content) == 0:
+        raise HTTPException(400, "Empty file")
+
+    # Save to temp file
+    tmp_dir = tempfile.mkdtemp()
+    input_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}.dgn")
+
+    try:
+        with open(input_path, "wb") as f:
+            f.write(content)
+
+        logger.info(f"Converting {file.filename} ({len(content)} bytes) to {format}")
+
+        result = convert_dgn_to_format(input_path, format, source_epsg)
+
+        # Determine content type
+        if format.upper() == "KML":
+            media_type = "application/vnd.google-earth.kml+xml"
+            out_ext = ".kml"
+        else:
+            media_type = "application/geo+json"
+            out_ext = ".geojson"
+
+        out_filename = file.filename.rsplit(".", 1)[0] + out_ext
+
+        return Response(
+            content=result,
+            media_type=media_type,
+            headers={
+                "Content-Disposition": f'attachment; filename="{out_filename}"',
+                "X-Original-Filename": file.filename,
+                "X-Output-Format": format.upper(),
+            },
+        )
+
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        logger.error(f"Conversion failed: {e}", exc_info=True)
+        raise HTTPException(500, f"Conversion failed: {str(e)}")
+    finally:
+        # Cleanup
+        try:
+            os.remove(input_path)
+            os.rmdir(tmp_dir)
+        except Exception:
+            pass
+
+
+# Common VN2000 EPSG codes for reference
+VN2000_CODES = {
+    "VN2000 / TM-3 zone 481 (Mui 3, KTT 104.75)": 9205,
+    "VN2000 / TM-3 zone 482 (Mui 3, KTT 105.75)": 9206,
+    "VN2000 / TM-3 zone 491 (Mui 3, KTT 106.25)": 9207,
+    "VN2000 / UTM zone 48N (Mui 6)": 9209,
+    "VN2000 / UTM zone 49N (Mui 6)": 9210,
+}
+
+
+@app.get("/epsg-codes")
+def list_epsg_codes():
+    """List common VN2000 EPSG codes for coordinate transformation."""
+    return {"codes": VN2000_CODES}
