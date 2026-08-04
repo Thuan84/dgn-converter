@@ -48,6 +48,20 @@ def health():
     return {"status": "ok"}
 
 
+@app.get("/drivers")
+def list_drivers():
+    """List all available OGR drivers — useful for debugging DGN support."""
+    drivers = []
+    for i in range(ogr.GetDriverCount()):
+        drv = ogr.GetDriver(i)
+        drivers.append(drv.GetName())
+    dgn_support = {
+        "DGN_V7": "DGN" in drivers,
+        "DGN_V8": "DGNV8" in drivers,
+    }
+    return {"drivers": sorted(drivers), "dgn_support": dgn_support, "total": len(drivers)}
+
+
 def detect_source_srs(datasource) -> osr.SpatialReference | None:
     """Try to detect the spatial reference from the DGN file."""
     layer = datasource.GetLayer(0)
@@ -78,10 +92,31 @@ def convert_dgn_to_format(
     Returns:
         Converted file content as bytes
     """
-    # Open source DGN
-    src_ds = ogr.Open(input_path, 0)
+    # Try to open DGN with explicit drivers
+    src_ds = None
+    tried_drivers = []
+
+    # Try DGN V8 driver first (MicroStation V8+)
+    for driver_name_try in ["DGNV8", "DGN"]:
+        drv = ogr.GetDriverByName(driver_name_try)
+        if drv is not None:
+            tried_drivers.append(driver_name_try)
+            src_ds = drv.Open(input_path, 0)
+            if src_ds is not None:
+                logger.info(f"Opened DGN with driver: {driver_name_try}")
+                break
+
+    # Fallback: let OGR auto-detect
     if src_ds is None:
-        raise ValueError("Cannot open DGN file. File may be corrupted or not a valid DGN.")
+        tried_drivers.append("auto-detect")
+        src_ds = ogr.Open(input_path, 0)
+
+    if src_ds is None:
+        available = ", ".join(tried_drivers)
+        raise ValueError(
+            f"Cannot open DGN file. Tried drivers: [{available}]. "
+            f"The file may be DGN V8 format (requires Teigha/ODA libraries) or corrupted."
+        )
 
     layer_count = src_ds.GetLayerCount()
     if layer_count == 0:
