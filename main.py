@@ -80,14 +80,16 @@ def convert_dgn_to_format(
     input_path: str,
     output_format: str = "KML",
     source_epsg: int | None = None,
+    central_meridian: float | None = None,
 ) -> bytes:
     """
-    Convert a DGN file to KML or GeoJSON using OGR.
+    Convert a DGN/DXF file to KML or GeoJSON using OGR.
 
     Args:
-        input_path: Path to input .dgn file
+        input_path: Path to input file
         output_format: 'KML' or 'GeoJSON'
-        source_epsg: EPSG code of source coordinate system (e.g., 9210 for VN2000)
+        source_epsg: EPSG code of source coordinate system
+        central_meridian: Central meridian (lon_0) for VN2000 provincial system
 
     Returns:
         Converted file content as bytes
@@ -139,7 +141,8 @@ def convert_dgn_to_format(
         raise RuntimeError(f"OGR driver '{driver_name}' not available")
 
     # Create output file
-    output_path = input_path.replace(".dgn", ext)
+    base_name = os.path.splitext(input_path)[0]
+    output_path = base_name + ext
     if os.path.exists(output_path):
         os.remove(output_path)
 
@@ -153,7 +156,21 @@ def convert_dgn_to_format(
     target_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
 
     coord_transform = None
-    if source_epsg:
+    if central_meridian:
+        # Build VN2000 provincial projection from central meridian
+        vn2000_proj = (
+            f'+proj=tmerc +lat_0=0 +lon_0={central_meridian} +k=0.9999 '
+            f'+x_0=500000 +y_0=0 +ellps=WGS84 '
+            f'+towgs84=-191.90441429,-39.30318279,-111.45032835,'
+            f'-0.00928836,0.01975479,-0.00427372,0.252906278 '
+            f'+units=m +no_defs'
+        )
+        source_srs = osr.SpatialReference()
+        source_srs.ImportFromProj4(vn2000_proj)
+        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+        coord_transform = osr.CoordinateTransformation(source_srs, target_srs)
+        logger.info(f"Using VN2000 with central meridian: {central_meridian}")
+    elif source_epsg:
         source_srs = osr.SpatialReference()
         source_srs.ImportFromEPSG(source_epsg)
         source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
@@ -237,9 +254,10 @@ def convert_dgn_to_format(
 
 @app.post("/convert")
 async def convert_dgn(
-    file: UploadFile = File(..., description="DGN file to convert"),
+    file: UploadFile = File(..., description="DGN/DXF file to convert"),
     format: str = Query("KML", description="Output format: KML or GeoJSON"),
     source_epsg: int | None = Query(None, description="Source EPSG code (e.g., 9210 for VN2000 Mui 6)"),
+    central_meridian: float | None = Query(None, description="Central meridian for VN2000 provincial system (e.g., 108.25 for Ninh Thuan)"),
 ):
     """
     Convert a DGN file to KML or GeoJSON.
@@ -275,7 +293,7 @@ async def convert_dgn(
 
         logger.info(f"Converting {file.filename} ({len(content)} bytes) to {format}")
 
-        result = convert_dgn_to_format(input_path, format, source_epsg)
+        result = convert_dgn_to_format(input_path, format, source_epsg, central_meridian)
 
         # Determine content type
         if format.upper() == "KML":
