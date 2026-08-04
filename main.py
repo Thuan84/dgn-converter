@@ -136,6 +136,47 @@ def _postprocess_kml(kml_content: str) -> str:
     return kml_content
 
 
+def _polygon_to_linestring(geom):
+    """Convert a polygon geometry to its boundary linestring(s).
+
+    This eliminates polygon fills entirely — only the outline remains.
+    Works for both Polygon and MultiPolygon.
+    """
+    geom_type = geom.GetGeometryType()
+    rings = []
+
+    if geom_type in (ogr.wkbPolygon, ogr.wkbPolygon25D):
+        for ring_idx in range(geom.GetGeometryCount()):
+            ring = geom.GetGeometryRef(ring_idx)
+            if ring and ring.GetPointCount() > 1:
+                line = ogr.Geometry(ogr.wkbLineString)
+                for pt_idx in range(ring.GetPointCount()):
+                    line.AddPoint(*ring.GetPoint(pt_idx))
+                rings.append(line)
+
+    elif geom_type in (ogr.wkbMultiPolygon, ogr.wkbMultiPolygon25D):
+        for poly_idx in range(geom.GetGeometryCount()):
+            poly = geom.GetGeometryRef(poly_idx)
+            if poly:
+                sub = _polygon_to_linestring(poly)
+                if sub:
+                    if sub.GetGeometryType() == ogr.wkbLineString:
+                        rings.append(sub)
+                    else:
+                        for k in range(sub.GetGeometryCount()):
+                            rings.append(sub.GetGeometryRef(k).Clone())
+
+    if not rings:
+        return None
+    if len(rings) == 1:
+        return rings[0]
+
+    multi = ogr.Geometry(ogr.wkbMultiLineString)
+    for r in rings:
+        multi.AddGeometry(r)
+    return multi
+
+
 def convert_dgn_to_format(
     input_path: str,
     output_format: str = "KML",
@@ -243,10 +284,17 @@ def convert_dgn_to_format(
             coord_transform = osr.CoordinateTransformation(detected_srs, target_srs)
 
     total_features = 0
-    skipped_text = 0
+    skipped = 0
 
-    # Geometry types to skip (text annotations, points that are just markers)
-    SKIP_GEOM_TYPES = {ogr.wkbPoint, ogr.wkbPoint25D, ogr.wkbMultiPoint, ogr.wkbMultiPoint25D}
+    # Polygon types that should be converted to linestrings (to avoid fills)
+    POLYGON_TYPES = {
+        ogr.wkbPolygon, ogr.wkbPolygon25D,
+        ogr.wkbMultiPolygon, ogr.wkbMultiPolygon25D,
+    }
+    POINT_TYPES = {
+        ogr.wkbPoint, ogr.wkbPoint25D,
+        ogr.wkbMultiPoint, ogr.wkbMultiPoint25D,
+    }
 
     for i in range(layer_count):
         src_layer = src_ds.GetLayer(i)
@@ -270,7 +318,7 @@ def convert_dgn_to_format(
             field_defn = src_defn.GetFieldDefn(j)
             out_layer.CreateField(field_defn)
 
-        # Copy features (skip text annotations and point markers)
+        # Process features
         src_layer.ResetReading()
         feature = src_layer.GetNextFeature()
         while feature is not None:
@@ -278,17 +326,31 @@ def convert_dgn_to_format(
             if geom is not None:
                 geom_type = geom.GetGeometryType()
 
-                # Skip point features (usually DGN text annotations / cell markers)
-                if geom_type in SKIP_GEOM_TYPES:
-                    skipped_text += 1
-                    feature = src_layer.GetNextFeature()
-                    continue
+                # Point features: keep only if they have meaningful text (not just numbers)
+                if geom_type in POINT_TYPES:
+                    text_val = feature.GetField("Text") if feature.GetFieldIndex("Text") >= 0 else None
+                    if text_val is None:
+                        text_val = feature.GetField("Name") if feature.GetFieldIndex("Name") >= 0 else None
+                    # Skip if text is empty, purely numeric, or very short number
+                    if not text_val or re.match(r'^\s*\d{1,5}\s*$', str(text_val)):
+                        skipped += 1
+                        feature = src_layer.GetNextFeature()
+                        continue
 
                 if coord_transform:
                     geom.Transform(coord_transform)
 
-                out_feature = ogr.Feature(out_layer.GetLayerDefn())
-                out_feature.SetGeometry(geom)
+                # Convert polygons to their boundary linestrings (no fill!)
+                if geom_type in POLYGON_TYPES:
+                    boundary_geom = _polygon_to_linestring(geom)
+                    if boundary_geom is None:
+                        feature = src_layer.GetNextFeature()
+                        continue
+                    out_feature = ogr.Feature(out_layer.GetLayerDefn())
+                    out_feature.SetGeometry(boundary_geom)
+                else:
+                    out_feature = ogr.Feature(out_layer.GetLayerDefn())
+                    out_feature.SetGeometry(geom)
 
                 # Copy field values
                 for j in range(feature.GetFieldCount()):
@@ -306,7 +368,7 @@ def convert_dgn_to_format(
     out_ds = None
     src_ds = None
 
-    logger.info(f"Converted {total_features} features, skipped {skipped_text} text/point annotations")
+    logger.info(f"Converted {total_features} features, skipped {skipped} text/point annotations")
 
     if total_features == 0:
         raise ValueError("No geometry features found in DGN file.")
