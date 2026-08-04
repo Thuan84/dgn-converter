@@ -7,6 +7,7 @@ Deployed on Render.com (Free Tier).
 """
 
 import os
+import re
 import uuid
 import tempfile
 import logging
@@ -74,6 +75,65 @@ def detect_source_srs(datasource) -> osr.SpatialReference | None:
 
     # If no SRS found, return None (caller will handle default)
     return None
+
+
+
+
+def _postprocess_kml(kml_content: str) -> str:
+    """Post-process KML to fix polygon styling from DGN conversion.
+
+    - Remove opaque polygon fills (set to transparent)
+    - Add default style with outline-only polygons
+    - Clean up DGN-generated inline styles
+    """
+    # Remove all existing PolyStyle blocks (they contain opaque fills from DGN)
+    kml_content = re.sub(
+        r'<PolyStyle>.*?</PolyStyle>',
+        '<PolyStyle><fill>0</fill><outline>1</outline></PolyStyle>',
+        kml_content,
+        flags=re.DOTALL,
+    )
+
+    # If there are Style blocks with color fills, make polygon colors transparent
+    # KML color format: aabbggrr (alpha-blue-green-red)
+    # Replace any polygon fill color with fully transparent
+    kml_content = re.sub(
+        r'(<PolyStyle>\s*<color>)[0-9a-fA-F]{8}(</color>)',
+        r'\g<1>00000000\2',
+        kml_content,
+    )
+
+    # Inject a default shared style at the top of Document for clean outlines
+    default_style = """
+    <Style id="dgn_outline">
+      <LineStyle>
+        <color>ff0000ff</color>
+        <width>1.5</width>
+      </LineStyle>
+      <PolyStyle>
+        <fill>0</fill>
+        <outline>1</outline>
+      </PolyStyle>
+    </Style>"""
+
+    # Insert after <Document> tag
+    kml_content = kml_content.replace(
+        '<Document>',
+        f'<Document>{default_style}',
+        1,
+    )
+
+    # Point Placemarks with just a name like "17" are DGN text annotations - remove them
+    kml_content = re.sub(
+        r'<Placemark>\s*<name>\d{1,4}</name>\s*<Style>.*?</Style>\s*'
+        r'<Point>.*?</Point>\s*</Placemark>',
+        '',
+        kml_content,
+        flags=re.DOTALL,
+    )
+
+    logger.info("KML post-processing: removed opaque fills, added outline style")
+    return kml_content
 
 
 def convert_dgn_to_format(
@@ -183,6 +243,10 @@ def convert_dgn_to_format(
             coord_transform = osr.CoordinateTransformation(detected_srs, target_srs)
 
     total_features = 0
+    skipped_text = 0
+
+    # Geometry types to skip (text annotations, points that are just markers)
+    SKIP_GEOM_TYPES = {ogr.wkbPoint, ogr.wkbPoint25D, ogr.wkbMultiPoint, ogr.wkbMultiPoint25D}
 
     for i in range(layer_count):
         src_layer = src_ds.GetLayer(i)
@@ -193,11 +257,11 @@ def convert_dgn_to_format(
         feature_count = src_layer.GetFeatureCount()
         logger.info(f"Processing layer '{layer_name}' with {feature_count} features")
 
-        # Create output layer
+        # Create output layer - force to generic geometry so mixed types work
         out_layer = out_ds.CreateLayer(
             layer_name,
             srs=target_srs,
-            geom_type=src_layer.GetGeomType(),
+            geom_type=ogr.wkbUnknown,
         )
 
         # Copy field definitions
@@ -206,12 +270,20 @@ def convert_dgn_to_format(
             field_defn = src_defn.GetFieldDefn(j)
             out_layer.CreateField(field_defn)
 
-        # Copy features
+        # Copy features (skip text annotations and point markers)
         src_layer.ResetReading()
         feature = src_layer.GetNextFeature()
         while feature is not None:
             geom = feature.GetGeometryRef()
             if geom is not None:
+                geom_type = geom.GetGeometryType()
+
+                # Skip point features (usually DGN text annotations / cell markers)
+                if geom_type in SKIP_GEOM_TYPES:
+                    skipped_text += 1
+                    feature = src_layer.GetNextFeature()
+                    continue
+
                 if coord_transform:
                     geom.Transform(coord_transform)
 
@@ -230,18 +302,23 @@ def convert_dgn_to_format(
 
             feature = src_layer.GetNextFeature()
 
-    # Cleanup
+    # Cleanup OGR datasets
     out_ds = None
     src_ds = None
 
-    logger.info(f"Converted {total_features} features total")
+    logger.info(f"Converted {total_features} features, skipped {skipped_text} text/point annotations")
 
     if total_features == 0:
         raise ValueError("No geometry features found in DGN file.")
 
-    # Read output
-    with open(output_path, "rb") as f:
+    # Read output and post-process KML to fix polygon styling
+    with open(output_path, "r", encoding="utf-8") as f:
         content = f.read()
+
+    if output_format.upper() == "KML":
+        content = _postprocess_kml(content)
+
+    result = content.encode("utf-8")
 
     # Cleanup temp output
     try:
@@ -249,7 +326,7 @@ def convert_dgn_to_format(
     except Exception:
         pass
 
-    return content
+    return result
 
 
 @app.post("/convert")
