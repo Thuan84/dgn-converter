@@ -372,6 +372,16 @@ def convert_dgn_to_format(
         if drv:
             tried_drivers.append("DXF")
             src_ds = drv.Open(input_path, 0)
+    elif file_ext in ('.dwg',):
+        # Try CAD driver (uses OpenCAD library) and DWG driver
+        for driver_name_try in ["CAD", "DWG"]:
+            drv = ogr.GetDriverByName(driver_name_try)
+            if drv is not None:
+                tried_drivers.append(driver_name_try)
+                src_ds = drv.Open(input_path, 0)
+                if src_ds is not None:
+                    logger.info(f"Opened DWG with driver: {driver_name_try}")
+                    break
 
     # Fallback: let OGR auto-detect
     if src_ds is None:
@@ -649,7 +659,7 @@ def convert_dgn_to_format(
 
 @app.post("/convert")
 async def convert_dgn(
-    file: UploadFile = File(..., description="DGN/DXF file to convert"),
+    file: UploadFile = File(..., description="DGN/DXF/DWG file to convert"),
     format: str = Query("KML", description="Output format: KML or GeoJSON"),
     source_epsg: int | None = Query(None, description="Source EPSG code (e.g., 9210 for VN2000 Mui 6)"),
     central_meridian: float | None = Query(None, description="Central meridian for VN2000 provincial system (e.g., 108.25 for Ninh Thuan)"),
@@ -665,7 +675,7 @@ async def convert_dgn(
     if not file.filename:
         raise HTTPException(400, "No filename provided")
 
-    allowed_ext = (".dgn", ".dxf")
+    allowed_ext = (".dgn", ".dxf", ".dwg")
     if not file.filename.lower().endswith(allowed_ext):
         raise HTTPException(400, f"Only {', '.join(allowed_ext)} files are accepted")
 
