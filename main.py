@@ -402,11 +402,16 @@ def convert_dgn_to_format(
                             tried_drivers.append("libredwg→DXF")
                             logger.info("Successfully opened libredwg-converted DXF")
                             input_path = dxf_path
+                        else:
+                            tried_drivers.append("libredwg→DXF(failed to open)")
                 else:
+                    tried_drivers.append(f"dwg2dxf_failed(rc={result.returncode}, err={result.stderr[:100]})")
                     logger.warning(f"dwg2dxf failed: {result.stderr[:500]}")
             except FileNotFoundError:
+                tried_drivers.append("dwg2dxf_not_found")
                 logger.warning("dwg2dxf not found (libredwg-tools not installed)")
             except Exception as e:
+                tried_drivers.append(f"dwg2dxf_err({str(e)})")
                 logger.warning(f"dwg2dxf conversion error: {e}")
 
     # Fallback: let OGR auto-detect
