@@ -383,6 +383,32 @@ def convert_dgn_to_format(
                     logger.info(f"Opened DWG with driver: {driver_name_try}")
                     break
 
+        # Fallback: use libredwg's dwg2dxf to convert DWG → DXF
+        if src_ds is None:
+            logger.info("GDAL CAD driver failed. Trying libredwg dwg2dxf conversion...")
+            try:
+                import subprocess
+                dxf_path = input_path.replace('.dwg', '.dxf')
+                result = subprocess.run(
+                    ["dwg2dxf", "-y", "-o", dxf_path, input_path],
+                    capture_output=True, text=True, timeout=120
+                )
+                if result.returncode == 0 and os.path.isfile(dxf_path) and os.path.getsize(dxf_path) > 0:
+                    logger.info(f"dwg2dxf converted: {dxf_path} ({os.path.getsize(dxf_path)} bytes)")
+                    drv = ogr.GetDriverByName("DXF")
+                    if drv:
+                        src_ds = drv.Open(dxf_path, 0)
+                        if src_ds:
+                            tried_drivers.append("libredwg→DXF")
+                            logger.info("Successfully opened libredwg-converted DXF")
+                            input_path = dxf_path
+                else:
+                    logger.warning(f"dwg2dxf failed: {result.stderr[:500]}")
+            except FileNotFoundError:
+                logger.warning("dwg2dxf not found (libredwg-tools not installed)")
+            except Exception as e:
+                logger.warning(f"dwg2dxf conversion error: {e}")
+
     # Fallback: let OGR auto-detect
     if src_ds is None:
         tried_drivers.append("auto-detect")
