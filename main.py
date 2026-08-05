@@ -380,11 +380,16 @@ def convert_dgn_to_format(
 
     if src_ds is None:
         available = ", ".join(tried_drivers)
-        # Include file format detection in error
         fmt_msg = f" Detected format: {file_format_info}." if file_ext == '.dgn' and file_format_info else ""
+
+        if file_ext == '.dgn' and 'V8' in (file_format_info or ''):
+            raise ValueError(
+                f"File DGN V8 không được hỗ trợ trực tiếp. "
+                f"Vui lòng mở file trong MicroStation → File → Save As → "
+                f"chọn định dạng DXF hoặc DGN V7 → upload lại file mới."
+            )
         raise ValueError(
-            f"Cannot open file.{fmt_msg} Tried drivers: [{available}]. "
-            f"If DGN V8, please export to .dxf from MicroStation first."
+            f"Cannot open file.{fmt_msg} Tried drivers: [{available}]."
         )
 
     layer_count = src_ds.GetLayerCount()
