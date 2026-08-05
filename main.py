@@ -63,6 +63,74 @@ def list_drivers():
     return {"drivers": sorted(drivers), "dgn_support": dgn_support, "total": len(drivers)}
 
 
+@app.post("/inspect")
+async def inspect_dgn(file: UploadFile = File(...)):
+    """Inspect DGN field names and sample values — for debugging label extraction."""
+    content = await file.read()
+    import tempfile, uuid, os
+    tmp_dir = tempfile.mkdtemp()
+    ext = os.path.splitext(file.filename or "test.dgn")[1].lower()
+    tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}{ext}")
+    with open(tmp_path, "wb") as f:
+        f.write(content)
+
+    result = {"layers": []}
+    for drv_name in ["DGNV8", "DGN"]:
+        drv = ogr.GetDriverByName(drv_name)
+        if not drv:
+            continue
+        ds = drv.Open(tmp_path, 0)
+        if not ds:
+            continue
+
+        result["driver_used"] = drv_name
+        for i in range(ds.GetLayerCount()):
+            lyr = ds.GetLayer(i)
+            if not lyr:
+                continue
+            defn = lyr.GetLayerDefn()
+            fields = []
+            for j in range(defn.GetFieldCount()):
+                fd = defn.GetFieldDefn(j)
+                fields.append({"name": fd.GetName(), "type": fd.GetTypeName()})
+
+            # Sample first 10 POINT features
+            samples = []
+            lyr.ResetReading()
+            feat = lyr.GetNextFeature()
+            checked = 0
+            while feat and checked < 200 and len(samples) < 10:
+                checked += 1
+                geom = feat.GetGeometryRef()
+                if geom and geom.GetGeometryType() in (ogr.wkbPoint, ogr.wkbPoint25D):
+                    row = {}
+                    for j in range(defn.GetFieldCount()):
+                        try:
+                            row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
+                        except Exception:
+                            row[defn.GetFieldDefn(j).GetName()] = None
+                    samples.append(row)
+                feat = lyr.GetNextFeature()
+
+            result["layers"].append({
+                "name": lyr.GetName(),
+                "fields": fields,
+                "point_samples": samples,
+            })
+        ds = None
+        break
+
+    try:
+        os.remove(tmp_path)
+        os.rmdir(tmp_dir)
+    except Exception:
+        pass
+
+    return result
+
+
+
+
 def detect_source_srs(datasource) -> osr.SpatialReference | None:
     """Try to detect the spatial reference from the DGN file."""
     layer = datasource.GetLayer(0)
@@ -80,12 +148,18 @@ def detect_source_srs(datasource) -> osr.SpatialReference | None:
 
 
 def _postprocess_kml(kml_content: str) -> str:
-    """Post-process KML to fix polygon styling from DGN conversion.
+    """Post-process KML to fix polygon styling and point labels from DGN conversion.
 
     - Remove opaque polygon fills (set to transparent)
+    - Fix <name> for text-point Placemarks: extract from ExtendedData when name is a
+      raw DGN type number (e.g. '17') or empty
     - Add default style with outline-only polygons
-    - Clean up DGN-generated inline styles
     """
+    # Fix Point Placemark names: extract actual text label from ExtendedData
+    # GDAL DGN driver stores the text in fields like EntityNum/Text/TextString
+    # but KML <name> gets the element type code (e.g., '17' for text elements)
+    kml_content = _fix_point_labels(kml_content)
+
     # Remove all existing PolyStyle blocks (they contain opaque fills from DGN)
     kml_content = re.sub(
         r'<PolyStyle>.*?</PolyStyle>',
@@ -95,8 +169,6 @@ def _postprocess_kml(kml_content: str) -> str:
     )
 
     # If there are Style blocks with color fills, make polygon colors transparent
-    # KML color format: aabbggrr (alpha-blue-green-red)
-    # Replace any polygon fill color with fully transparent
     kml_content = re.sub(
         r'(<PolyStyle>\s*<color>)[0-9a-fA-F]{8}(</color>)',
         r'\g<1>00000000\2',
@@ -116,15 +188,94 @@ def _postprocess_kml(kml_content: str) -> str:
       </PolyStyle>
     </Style>"""
 
-    # Insert after <Document> tag
-    kml_content = kml_content.replace(
-        '<Document>',
-        f'<Document>{default_style}',
-        1,
-    )
+    kml_content = kml_content.replace('<Document>', f'<Document>{default_style}', 1)
 
-    logger.info("KML post-processing: removed opaque fills, added outline style")
+    logger.info("KML post-processing: fixed labels + removed opaque fills + added outline style")
     return kml_content
+
+
+def _fix_point_labels(kml_content: str) -> str:
+    """Fix <name> for Point Placemarks that have a numeric-only or empty name.
+
+    GDAL DGN → KML outputs element type code (17 = text element) as <name>.
+    The actual text string is in <ExtendedData><SimpleData name="EntityNum"> or
+    <SimpleData name="Text"> or <SimpleData name="TextString">.
+
+    Strategy:
+    1. Parse only Placemarks that contain <Point> geometry
+    2. If their <name> is numeric-only (or empty): extract real text from ExtendedData
+    3. If no real text found: remove the Placemark entirely (pure geometry elements)
+    """
+    from xml.etree import ElementTree as ET
+
+    # Work on Placemark blocks individually via regex to avoid full XML parse overhead
+    # Pattern: capture each <Placemark>...</Placemark> block
+    placemark_re = re.compile(r'<Placemark\b[^>]*>.*?</Placemark>', re.DOTALL)
+
+    # Field priority order for actual text label
+    TEXT_FIELD_NAMES = ['EntityNum', 'Text', 'TextString', 'text', 'TEXT', 'Label',
+                        'Description', 'Name']
+
+    def _is_numeric_name(name: str) -> bool:
+        """Return True if name is empty or just a number (likely a DGN type code)."""
+        name = name.strip()
+        return not name or name.isdigit()
+
+    def _process_placemark(m: re.Match) -> str:
+        block = m.group(0)
+
+        # Only process if it contains a Point
+        if '<Point>' not in block and '<Point ' not in block:
+            return block  # Lines/polygons: keep as-is
+
+        # Extract current <name>
+        name_m = re.search(r'<name>(.*?)</name>', block, re.DOTALL)
+        current_name = name_m.group(1).strip() if name_m else ''
+
+        if not _is_numeric_name(current_name):
+            # Name looks meaningful already (e.g., "CLN", "HNK 280") — keep it
+            return block
+
+        # Try <description> first (GDAL may put text label there)
+        extracted_text = ''
+        desc_m = re.search(r'<description>(.*?)</description>', block, re.DOTALL)
+        if desc_m:
+            desc_val = desc_m.group(1).strip()
+            if desc_val and not desc_val.isdigit():
+                extracted_text = desc_val
+            elif desc_val and desc_val.isdigit() and len(desc_val) >= 3:
+                extracted_text = desc_val
+
+        # Try SimpleData fields in ExtendedData
+        if not extracted_text:
+            for field_name in TEXT_FIELD_NAMES:
+                pat = rf'<SimpleData name="{re.escape(field_name)}">(.*?)</SimpleData>'
+                sd_m = re.search(pat, block, re.DOTALL | re.IGNORECASE)
+                if sd_m:
+                    val = sd_m.group(1).strip()
+                    if val and not val.isdigit():
+                        extracted_text = val
+                        break
+                    elif val and val.isdigit() and len(val) >= 3:
+                        extracted_text = val
+                        break
+
+        if not extracted_text:
+            # No useful text found → remove this point entirely (it's a DGN non-text element)
+            return ''
+
+        # Replace or insert <name> with extracted text
+        if name_m:
+            block = block[:name_m.start()] + f'<name>{extracted_text}</name>' + block[name_m.end():]
+        else:
+            block = block.replace('<Placemark>', f'<Placemark><name>{extracted_text}</name>', 1)
+
+        return block
+
+    result = placemark_re.sub(_process_placemark, kml_content)
+    return result
+
+
 
 
 def _polygon_to_linestring(geom):
@@ -300,6 +451,9 @@ def convert_dgn_to_format(
 
     total_features = 0
     skipped = 0
+    total_points = 0
+    # Max point labels to avoid crashing browser (DGN cadastral files can have 50k+ points)
+    MAX_POINT_LABELS = 3000
 
     # Polygon types that should be converted to linestrings (to avoid fills)
     POLYGON_TYPES = {
@@ -310,6 +464,11 @@ def convert_dgn_to_format(
         ogr.wkbPoint, ogr.wkbPoint25D,
         ogr.wkbMultiPoint, ogr.wkbMultiPoint25D,
     }
+
+    # Common DGN text field names (GDAL exposes DGN text as these fields)
+    # EntityNum is the GDAL DGN driver field that contains the actual text annotation
+    TEXT_FIELDS = ['EntityNum', 'Text', 'TEXT', 'text', 'Label', 'LABEL', 'TextString',
+                   'Feature_Code', 'Description', 'Name', 'NAME']
 
     for i in range(layer_count):
         src_layer = src_ds.GetLayer(i)
@@ -327,22 +486,90 @@ def convert_dgn_to_format(
             geom_type=ogr.wkbUnknown,
         )
 
-        # Copy field definitions
+        # Copy field definitions from source layer
         src_defn = src_layer.GetLayerDefn()
         for j in range(src_defn.GetFieldCount()):
             field_defn = src_defn.GetFieldDefn(j)
             out_layer.CreateField(field_defn)
 
-        # Process features
+        # Add a 'Name' field — GDAL KML driver maps the 'Name' field to <name>
+        # We populate it with the actual text extracted from StyleString for point features
+        name_field_already_exists = src_defn.GetFieldIndex('Name') >= 0
+        if not name_field_already_exists:
+            out_layer.CreateField(ogr.FieldDefn('Name', ogr.OFTString))
+        out_defn = out_layer.GetLayerDefn()
+        name_out_idx = out_defn.GetFieldIndex('Name')
+
         src_layer.ResetReading()
         feature = src_layer.GetNextFeature()
         while feature is not None:
             geom = feature.GetGeometryRef()
+            current_text_label = ''  # reset each feature iteration
             if geom is not None:
                 geom_type = geom.GetGeometryType()
 
-                # Point features are text annotations in DGN (plot numbers, areas, land codes)
-                # Keep ALL of them — they are meaningful cadastral labels
+                # For point features: only keep if there is meaningful text label
+                if geom_type in POINT_TYPES:
+                    if total_points >= MAX_POINT_LABELS:
+                        feature = src_layer.GetNextFeature()
+                        skipped += 1
+                        continue
+
+                    current_text_label = ''
+                    src_defn_scan = src_layer.GetLayerDefn()
+
+                    # PRIMARY: Extract from OGR StyleString
+                    style_str = feature.GetStyleString() or ''
+                    if style_str:
+                        m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style_str)
+                        if not m:
+                            m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style_str)
+                        if m:
+                            current_text_label = m.group(1).strip()
+
+                    # FALLBACK: scan fields with GetFieldAsString()
+                    if not current_text_label:
+                        for tf in TEXT_FIELDS:
+                            idx = src_defn_scan.GetFieldIndex(tf)
+                            if idx >= 0:
+                                try:
+                                    val = feature.GetFieldAsString(idx).strip()
+                                    if val and val != '0':
+                                        current_text_label = val
+                                        break
+                                except Exception:
+                                    pass
+
+                    # LAST RESORT: scan all string-typed fields
+                    if not current_text_label:
+                        for j in range(feature.GetFieldCount()):
+                            ft = src_defn_scan.GetFieldDefn(j).GetType()
+                            if ft == ogr.OFTString:
+                                try:
+                                    val = feature.GetFieldAsString(j).strip()
+                                    if val and val != '0' and not val.isdigit():
+                                        current_text_label = val
+                                        break
+                                except Exception:
+                                    pass
+
+                    # Debug: log first 5 found points
+                    if total_points < 5:
+                        all_fields = {
+                            f"{src_defn_scan.GetFieldDefn(j).GetName()}({src_defn_scan.GetFieldDefn(j).GetTypeName()})":
+                            feature.GetFieldAsString(j)
+                            for j in range(feature.GetFieldCount())
+                        }
+                        native = (feature.GetNativeData() or '')[:150]
+                        logger.info(f"[DEBUG] Pt#{total_points}: style={style_str[:120]} | fields={all_fields} | native={native} → label={repr(current_text_label)}")
+
+                    # Skip if no label
+                    if not current_text_label or not current_text_label.strip():
+                        feature = src_layer.GetNextFeature()
+                        skipped += 1
+                        continue
+
+                    total_points += 1
 
                 if coord_transform:
                     geom.Transform(coord_transform)
@@ -359,10 +586,18 @@ def convert_dgn_to_format(
                     out_feature = ogr.Feature(out_layer.GetLayerDefn())
                     out_feature.SetGeometry(geom)
 
-                # Copy field values
+                # Copy field values from source feature
                 for j in range(feature.GetFieldCount()):
                     try:
                         out_feature.SetField(j, feature.GetField(j))
+                    except Exception:
+                        pass
+
+                # For point features: set the Name field to extracted text label
+                # GDAL KML driver maps 'Name' field → <name> in each Placemark
+                if geom_type in POINT_TYPES and name_out_idx >= 0 and current_text_label:
+                    try:
+                        out_feature.SetField(name_out_idx, current_text_label)
                     except Exception:
                         pass
 
@@ -375,7 +610,7 @@ def convert_dgn_to_format(
     out_ds = None
     src_ds = None
 
-    logger.info(f"Converted {total_features} features, skipped {skipped} text/point annotations")
+    logger.info(f"Converted {total_features} features ({total_points} point labels), skipped {skipped} features")
 
     if total_features == 0:
         raise ValueError("No geometry features found in DGN file.")
@@ -385,6 +620,15 @@ def convert_dgn_to_format(
         content = f.read()
 
     if output_format.upper() == "KML":
+        # Debug: log a sample of the raw KML to see how GDAL structured Point Placemarks
+        import re as _re
+        pm_matches = list(_re.finditer(r'<Placemark\b[^>]*>.*?</Placemark>', content, _re.DOTALL))
+        point_samples = [m.group(0) for m in pm_matches if '<Point>' in m.group(0) or '<Point ' in m.group(0)]
+        if point_samples:
+            logger.info(f"[DEBUG] Raw KML - first Point Placemark sample:\n{point_samples[0][:600]}")
+        else:
+            logger.info("[DEBUG] No Point Placemarks found in raw KML output")
+
         content = _postprocess_kml(content)
 
     result = content.encode("utf-8")
