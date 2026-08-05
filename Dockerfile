@@ -1,9 +1,9 @@
 # Use FULL GDAL image for maximum format support (DGN V7, DGN V8, DXF, DWG...)
 FROM ghcr.io/osgeo/gdal:ubuntu-full-3.9.3
 
-# Install Python, pip, and libredwg (for DWG to DXF conversion)
+# Install Python and pip
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip python3-venv libredwg-tools && \
+    apt-get install -y --no-install-recommends python3-pip python3-venv && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
