@@ -319,6 +319,70 @@ def _polygon_to_linestring(geom):
     return multi
 
 
+def _cluster_text_points(
+    text_points: list,
+    threshold: float = 0.00015,
+) -> list:
+    """Cluster nearby text points into merged labels.
+
+    In DGN files, multi-line text nodes are decomposed by GDAL into individual
+    text elements, each at a slightly different coordinate. This function groups
+    them back together based on spatial proximity.
+
+    Args:
+        text_points: List of dicts with keys 'x', 'y', 'label'
+        threshold: Max distance (in degrees) to consider two points as part
+                   of the same text node. ~0.00015° ≈ 15m at equator.
+
+    Returns:
+        List of merged dicts with 'x', 'y', 'label' (multi-line joined)
+    """
+    if not text_points:
+        return []
+
+    # Sort by x then y for stable processing
+    pts = sorted(text_points, key=lambda p: (round(p['x'], 5), -p['y']))
+    used = [False] * len(pts)
+    clusters = []
+
+    for i, pt in enumerate(pts):
+        if used[i]:
+            continue
+        # Start a new cluster with this point
+        cluster = [pt]
+        used[i] = True
+
+        # Find all nearby unused points
+        for j in range(i + 1, len(pts)):
+            if used[j]:
+                continue
+            dx = abs(pts[j]['x'] - pt['x'])
+            dy = abs(pts[j]['y'] - pt['y'])
+            if dx < threshold and dy < threshold:
+                cluster.append(pts[j])
+                used[j] = True
+
+        # Sort cluster members top-to-bottom (highest Y first = top of text node)
+        cluster.sort(key=lambda p: -p['y'])
+
+        # Merge labels (skip duplicates within cluster)
+        seen_labels = []
+        for cp in cluster:
+            label = cp['label'].strip()
+            if label and label not in seen_labels:
+                seen_labels.append(label)
+
+        merged_label = ' '.join(seen_labels)
+        # Use centroid of cluster as position
+        cx = sum(c['x'] for c in cluster) / len(cluster)
+        cy = sum(c['y'] for c in cluster) / len(cluster)
+
+        clusters.append({'x': cx, 'y': cy, 'label': merged_label})
+
+    return clusters
+
+
+
 def convert_dgn_to_format(
     input_path: str,
     output_format: str = "KML",
@@ -524,6 +588,10 @@ def convert_dgn_to_format(
 
         src_layer.ResetReading()
         feature = src_layer.GetNextFeature()
+
+        # Buffer for text point features — will be clustered before output
+        text_point_buffer = []  # list of {'x': float, 'y': float, 'label': str}
+
         while feature is not None:
             geom = feature.GetGeometryRef()
             current_text_label = ''  # reset each feature iteration
@@ -593,6 +661,17 @@ def convert_dgn_to_format(
 
                     total_points += 1
 
+                # For point features: buffer them for clustering instead of writing directly
+                if geom_type in POINT_TYPES and current_text_label:
+                    pt_geom = geom.Clone()
+                    if coord_transform:
+                        pt_geom.Transform(coord_transform)
+                    x = pt_geom.GetX()
+                    y = pt_geom.GetY()
+                    text_point_buffer.append({'x': x, 'y': y, 'label': current_text_label})
+                    feature = src_layer.GetNextFeature()
+                    continue
+
                 if coord_transform:
                     geom.Transform(coord_transform)
 
@@ -615,18 +694,28 @@ def convert_dgn_to_format(
                     except Exception:
                         pass
 
-                # For point features: set the Name field to extracted text label
-                # GDAL KML driver maps 'Name' field → <name> in each Placemark
-                if geom_type in POINT_TYPES and name_out_idx >= 0 and current_text_label:
-                    try:
-                        out_feature.SetField(name_out_idx, current_text_label)
-                    except Exception:
-                        pass
-
                 out_layer.CreateFeature(out_feature)
                 total_features += 1
 
             feature = src_layer.GetNextFeature()
+
+        # Cluster buffered text points and write merged labels
+        if text_point_buffer:
+            clustered = _cluster_text_points(text_point_buffer)
+            logger.info(f"Clustered {len(text_point_buffer)} text points → {len(clustered)} merged labels")
+            for cp in clustered:
+                if total_points >= MAX_POINT_LABELS:
+                    skipped += 1
+                    continue
+                pt_geom = ogr.Geometry(ogr.wkbPoint)
+                pt_geom.AddPoint(cp['x'], cp['y'])
+                out_feature = ogr.Feature(out_layer.GetLayerDefn())
+                out_feature.SetGeometry(pt_geom)
+                if name_out_idx >= 0:
+                    out_feature.SetField(name_out_idx, cp['label'])
+                out_layer.CreateFeature(out_feature)
+                total_features += 1
+                total_points += 1
 
     # Cleanup OGR datasets
     out_ds = None
