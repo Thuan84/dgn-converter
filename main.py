@@ -320,15 +320,14 @@ def _polygon_to_linestring(geom):
 
 
 def _format_cadastral_label(labels: list) -> str:
-    """Format clustered DGN text labels into Vietnamese cadastral notation.
+    """Format clustered DGN text labels into multi-line cadastral notation.
 
-    Vietnamese cadastral DGN text nodes typically contain (in any order):
-    - Land type code: 2-4 uppercase letters (BHK, HNK, CLN, ONT, ODT, etc.)
-    - Parcel number: integer (usually smaller)
-    - Area in m²: integer or decimal (usually larger)
+    Matches MicroStation's stacked text node display:
+        CODE      (land type: 2L, HG/B, CLN, etc.)
+        parcel#   (parcel number)
+        area      (area in m²)
 
-    Output format: "CODE parcel/area" (e.g., "BHK 40/2325")
-    If only code + 1 number: "CODE number"
+    Lines are separated by newlines to enable multi-line rendering on the map.
     """
     if len(labels) == 1:
         return labels[0]
@@ -348,27 +347,27 @@ def _format_cadastral_label(labels: list) -> str:
         except ValueError:
             codes.append(label)
 
-    # Pattern: 1+ code + 2 numbers → cadastral label
+    # Pattern: 1+ code + 2+ numbers → stacked cadastral label
     if codes and len(numbers) >= 2:
         # Sort numbers ascending: smaller = parcel number, larger = area
         numbers.sort(key=lambda x: x[0])
+        code_str = ''.join(codes)
         parcel = numbers[0][1]
         area = numbers[-1][1]
-        code_str = ''.join(codes)
-        return f"{code_str} {parcel}/{area}"
+        return f"{code_str}\n{parcel}\n{area}"
 
     # Pattern: 1+ code + 1 number
     if codes and len(numbers) == 1:
         code_str = ''.join(codes)
-        return f"{code_str} {numbers[0][1]}"
+        return f"{code_str}\n{numbers[0][1]}"
 
     # Pattern: only numbers (e.g., parcel + area without code)
     if not codes and len(numbers) >= 2:
         numbers.sort(key=lambda x: x[0])
-        return f"{numbers[0][1]}/{numbers[-1][1]}"
+        return f"{numbers[0][1]}\n{numbers[-1][1]}"
 
-    # Fallback: space-join all
-    return ' '.join(labels)
+    # Fallback: newline-join all (preserve stacked display)
+    return '\n'.join(labels)
 
 
 def _cluster_text_points(
