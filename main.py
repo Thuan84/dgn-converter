@@ -361,76 +361,64 @@ def _cluster_text_points(
 ) -> list:
     """Cluster nearby text points into merged cadastral labels.
 
-    In DGN files, multi-line text nodes are decomposed by GDAL into individual
-    text elements, each at a slightly different coordinate. This function groups
-    them back together based on spatial proximity and formats them as standard
-    Vietnamese cadastral notation.
-
-    Args:
-        text_points: List of dicts with keys 'x', 'y', 'label'
-        threshold: Max distance (in degrees) to consider two points as part
-                   of the same text node. ~0.00010° ≈ 10m at equator.
-
-    Returns:
-        List of merged dicts with 'x', 'y', 'label' (formatted cadastral)
+    Uses grid-based spatial hashing for O(n) performance instead of O(n²).
     """
     if not text_points:
         return []
 
-    # Sort by x then y for stable processing
-    pts = sorted(text_points, key=lambda p: (round(p['x'], 5), -p['y']))
-    used = [False] * len(pts)
+    # Grid-based clustering: assign each point to a cell
+    cell_size = threshold
+    grid: dict = {}  # (cell_x, cell_y) -> list of point indices
+
+    for idx, pt in enumerate(text_points):
+        cx = int(pt['x'] / cell_size)
+        cy = int(pt['y'] / cell_size)
+        grid.setdefault((cx, cy), []).append(idx)
+
+    used = [False] * len(text_points)
     clusters = []
 
-    for i, pt in enumerate(pts):
-        if used[i]:
+    for idx, pt in enumerate(text_points):
+        if used[idx]:
             continue
-        # Start a new cluster with this point
+        used[idx] = True
         cluster = [pt]
-        used[i] = True
 
-        # Find all nearby unused points (within threshold in both x and y)
-        for j in range(i + 1, len(pts)):
-            if used[j]:
-                continue
-            # Check proximity to ANY point already in the cluster (chain-linking)
-            is_near = False
-            for cp in cluster:
-                dx = abs(pts[j]['x'] - cp['x'])
-                dy = abs(pts[j]['y'] - cp['y'])
-                if dx < threshold and dy < threshold:
-                    is_near = True
+        # Check only neighboring cells (3x3 grid around this point)
+        cx = int(pt['x'] / cell_size)
+        cy = int(pt['y'] / cell_size)
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                cell_key = (cx + dx, cy + dy)
+                if cell_key not in grid:
+                    continue
+                for j in grid[cell_key]:
+                    if used[j]:
+                        continue
+                    jpt = text_points[j]
+                    if abs(jpt['x'] - pt['x']) < threshold and abs(jpt['y'] - pt['y']) < threshold:
+                        cluster.append(jpt)
+                        used[j] = True
+                        if len(cluster) >= 5:
+                            break
+                if len(cluster) >= 5:
                     break
-            if is_near:
-                cluster.append(pts[j])
-                used[j] = True
+            if len(cluster) >= 5:
+                break
 
-        # Cap cluster size at 5 to avoid runaway merging
-        if len(cluster) > 5:
-            # Keep only the 3 closest to centroid
-            cx = sum(c['x'] for c in cluster) / len(cluster)
-            cy = sum(c['y'] for c in cluster) / len(cluster)
-            cluster.sort(key=lambda p: (p['x'] - cx) ** 2 + (p['y'] - cy) ** 2)
-            cluster = cluster[:3]
-
-        # Sort cluster members top-to-bottom (highest Y first = top of text node)
+        # Sort top-to-bottom, collect unique labels
         cluster.sort(key=lambda p: -p['y'])
-
-        # Collect unique labels preserving order
-        seen_labels = []
+        seen = []
         for cp in cluster:
-            label = cp['label'].strip()
-            if label and label not in seen_labels:
-                seen_labels.append(label)
+            lbl = cp['label'].strip()
+            if lbl and lbl not in seen:
+                seen.append(lbl)
 
-        # Format as cadastral label
-        merged_label = _format_cadastral_label(seen_labels)
-
-        # Use centroid of cluster as position
-        cx = sum(c['x'] for c in cluster) / len(cluster)
-        cy = sum(c['y'] for c in cluster) / len(cluster)
-
-        clusters.append({'x': cx, 'y': cy, 'label': merged_label})
+        clusters.append({
+            'x': sum(c['x'] for c in cluster) / len(cluster),
+            'y': sum(c['y'] for c in cluster) / len(cluster),
+            'label': _format_cadastral_label(seen),
+        })
 
     return clusters
 
@@ -650,27 +638,30 @@ def convert_dgn_to_format(
         # Buffer for text point features — will be clustered before output
         text_point_buffer = []  # list of {'x': float, 'y': float, 'label': str}
 
+        # Cache level field index (avoid repeated lookup per feature)
+        SKIP_LEVELS = {3, 13}
+        _level_idx = -1
+        _src_defn = src_layer.GetLayerDefn()
+        for lvl_name in ('Level', 'level', 'LEVEL'):
+            _level_idx = _src_defn.GetFieldIndex(lvl_name)
+            if _level_idx >= 0:
+                break
+
         while feature is not None:
             geom = feature.GetGeometryRef()
-            current_text_label = ''  # reset each feature iteration
+            current_text_label = ''
 
-            # Skip elements on excluded levels (survey reference marks, construction lines)
-            SKIP_LEVELS = {3, 13}
-            feature_level = None
-            for lvl_name in ('Level', 'level', 'LEVEL'):
-                idx = feature.GetDefnRef().GetFieldIndex(lvl_name)
-                if idx >= 0:
-                    val = feature.GetField(idx)
-                    if val is not None:
-                        try:
-                            feature_level = int(val)
-                        except (ValueError, TypeError):
-                            pass
-                    break
-            if feature_level is not None and feature_level in SKIP_LEVELS:
-                feature = src_layer.GetNextFeature()
-                skipped += 1
-                continue
+            # Fast level check using cached index
+            if _level_idx >= 0:
+                lv = feature.GetField(_level_idx)
+                if lv is not None:
+                    try:
+                        if int(lv) in SKIP_LEVELS:
+                            feature = src_layer.GetNextFeature()
+                            skipped += 1
+                            continue
+                    except (ValueError, TypeError):
+                        pass
 
             if geom is not None:
                 geom_type = geom.GetGeometryType()
@@ -707,28 +698,9 @@ def convert_dgn_to_format(
                                 except Exception:
                                     pass
 
-                    # LAST RESORT: scan all string-typed fields
-                    if not current_text_label:
-                        for j in range(feature.GetFieldCount()):
-                            ft = src_defn_scan.GetFieldDefn(j).GetType()
-                            if ft == ogr.OFTString:
-                                try:
-                                    val = feature.GetFieldAsString(j).strip()
-                                    if val and val != '0' and not val.isdigit():
-                                        current_text_label = val
-                                        break
-                                except Exception:
-                                    pass
 
-                    # Debug: log first 5 found points
-                    if total_points < 5:
-                        all_fields = {
-                            f"{src_defn_scan.GetFieldDefn(j).GetName()}({src_defn_scan.GetFieldDefn(j).GetTypeName()})":
-                            feature.GetFieldAsString(j)
-                            for j in range(feature.GetFieldCount())
-                        }
-                        native = (feature.GetNativeData() or '')[:150]
-                        logger.info(f"[DEBUG] Pt#{total_points}: style={style_str[:120]} | fields={all_fields} | native={native} → label={repr(current_text_label)}")
+
+
 
                     # Skip if no label
                     if not current_text_label or not current_text_label.strip():
