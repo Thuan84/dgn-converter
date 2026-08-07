@@ -654,8 +654,8 @@ def convert_dgn_to_format(
             geom = feature.GetGeometryRef()
             current_text_label = ''  # reset each feature iteration
 
-            # Skip elements on excluded levels (construction/reference lines)
-            SKIP_LEVELS = {3}
+            # Skip elements on excluded levels (survey reference marks, construction lines)
+            SKIP_LEVELS = {3, 13}
             feature_level = None
             for lvl_name in ('Level', 'level', 'LEVEL'):
                 idx = feature.GetDefnRef().GetFieldIndex(lvl_name)
