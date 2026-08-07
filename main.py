@@ -580,7 +580,7 @@ def convert_dgn_to_format(
     skipped = 0
     total_points = 0
     # Max point labels to avoid crashing browser (DGN cadastral files can have 50k+ points)
-    MAX_POINT_LABELS = 3000
+    MAX_POINT_LABELS = 5000
 
     # Polygon types that should be converted to linestrings (to avoid fills)
     POLYGON_TYPES = {
