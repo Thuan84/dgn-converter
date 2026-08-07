@@ -319,23 +319,76 @@ def _polygon_to_linestring(geom):
     return multi
 
 
+def _format_cadastral_label(labels: list) -> str:
+    """Format clustered DGN text labels into Vietnamese cadastral notation.
+
+    Vietnamese cadastral DGN text nodes typically contain (in any order):
+    - Land type code: 2-4 uppercase letters (BHK, HNK, CLN, ONT, ODT, etc.)
+    - Parcel number: integer (usually smaller)
+    - Area in m²: integer or decimal (usually larger)
+
+    Output format: "CODE parcel/area" (e.g., "BHK 40/2325")
+    If only code + 1 number: "CODE number"
+    """
+    if len(labels) == 1:
+        return labels[0]
+
+    # Separate alphabetic codes from numeric values
+    codes = []
+    numbers = []
+    for label in labels:
+        label = label.strip()
+        if not label:
+            continue
+        # Try to parse as number (int or float)
+        clean = label.replace(',', '.')  # handle comma decimals
+        try:
+            num_val = float(clean)
+            numbers.append((num_val, label))
+        except ValueError:
+            codes.append(label)
+
+    # Pattern: 1+ code + 2 numbers → cadastral label
+    if codes and len(numbers) >= 2:
+        # Sort numbers ascending: smaller = parcel number, larger = area
+        numbers.sort(key=lambda x: x[0])
+        parcel = numbers[0][1]
+        area = numbers[-1][1]
+        code_str = ''.join(codes)
+        return f"{code_str} {parcel}/{area}"
+
+    # Pattern: 1+ code + 1 number
+    if codes and len(numbers) == 1:
+        code_str = ''.join(codes)
+        return f"{code_str} {numbers[0][1]}"
+
+    # Pattern: only numbers (e.g., parcel + area without code)
+    if not codes and len(numbers) >= 2:
+        numbers.sort(key=lambda x: x[0])
+        return f"{numbers[0][1]}/{numbers[-1][1]}"
+
+    # Fallback: space-join all
+    return ' '.join(labels)
+
+
 def _cluster_text_points(
     text_points: list,
-    threshold: float = 0.00015,
+    threshold: float = 0.00010,
 ) -> list:
-    """Cluster nearby text points into merged labels.
+    """Cluster nearby text points into merged cadastral labels.
 
     In DGN files, multi-line text nodes are decomposed by GDAL into individual
     text elements, each at a slightly different coordinate. This function groups
-    them back together based on spatial proximity.
+    them back together based on spatial proximity and formats them as standard
+    Vietnamese cadastral notation.
 
     Args:
         text_points: List of dicts with keys 'x', 'y', 'label'
         threshold: Max distance (in degrees) to consider two points as part
-                   of the same text node. ~0.00015° ≈ 15m at equator.
+                   of the same text node. ~0.00010° ≈ 10m at equator.
 
     Returns:
-        List of merged dicts with 'x', 'y', 'label' (multi-line joined)
+        List of merged dicts with 'x', 'y', 'label' (formatted cadastral)
     """
     if not text_points:
         return []
@@ -352,27 +405,43 @@ def _cluster_text_points(
         cluster = [pt]
         used[i] = True
 
-        # Find all nearby unused points
+        # Find all nearby unused points (within threshold in both x and y)
         for j in range(i + 1, len(pts)):
             if used[j]:
                 continue
-            dx = abs(pts[j]['x'] - pt['x'])
-            dy = abs(pts[j]['y'] - pt['y'])
-            if dx < threshold and dy < threshold:
+            # Check proximity to ANY point already in the cluster (chain-linking)
+            is_near = False
+            for cp in cluster:
+                dx = abs(pts[j]['x'] - cp['x'])
+                dy = abs(pts[j]['y'] - cp['y'])
+                if dx < threshold and dy < threshold:
+                    is_near = True
+                    break
+            if is_near:
                 cluster.append(pts[j])
                 used[j] = True
+
+        # Cap cluster size at 5 to avoid runaway merging
+        if len(cluster) > 5:
+            # Keep only the 3 closest to centroid
+            cx = sum(c['x'] for c in cluster) / len(cluster)
+            cy = sum(c['y'] for c in cluster) / len(cluster)
+            cluster.sort(key=lambda p: (p['x'] - cx) ** 2 + (p['y'] - cy) ** 2)
+            cluster = cluster[:3]
 
         # Sort cluster members top-to-bottom (highest Y first = top of text node)
         cluster.sort(key=lambda p: -p['y'])
 
-        # Merge labels (skip duplicates within cluster)
+        # Collect unique labels preserving order
         seen_labels = []
         for cp in cluster:
             label = cp['label'].strip()
             if label and label not in seen_labels:
                 seen_labels.append(label)
 
-        merged_label = ' '.join(seen_labels)
+        # Format as cadastral label
+        merged_label = _format_cadastral_label(seen_labels)
+
         # Use centroid of cluster as position
         cx = sum(c['x'] for c in cluster) / len(cluster)
         cy = sum(c['y'] for c in cluster) / len(cluster)
