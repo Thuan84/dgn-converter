@@ -707,15 +707,19 @@ def convert_dgn_to_format(
                 if total_points >= MAX_POINT_LABELS:
                     skipped += 1
                     continue
-                pt_geom = ogr.Geometry(ogr.wkbPoint)
-                pt_geom.AddPoint(cp['x'], cp['y'])
-                out_feature = ogr.Feature(out_layer.GetLayerDefn())
-                out_feature.SetGeometry(pt_geom)
-                if name_out_idx >= 0:
-                    out_feature.SetField(name_out_idx, cp['label'])
-                out_layer.CreateFeature(out_feature)
-                total_features += 1
-                total_points += 1
+                try:
+                    pt_geom = ogr.Geometry(ogr.wkbPoint)
+                    pt_geom.AddPoint(float(cp['x']), float(cp['y']), 0.0)
+                    out_feature = ogr.Feature(out_layer.GetLayerDefn())
+                    out_feature.SetGeometry(pt_geom)
+                    if name_out_idx >= 0:
+                        out_feature.SetField(name_out_idx, str(cp['label']))
+                    out_layer.CreateFeature(out_feature)
+                    total_features += 1
+                    total_points += 1
+                except Exception as e:
+                    logger.warning(f"Failed to write clustered point: {e}")
+                    continue
 
     # Cleanup OGR datasets
     out_ds = None
@@ -819,8 +823,10 @@ async def convert_dgn(
     except ValueError as e:
         raise HTTPException(422, str(e))
     except Exception as e:
-        logger.error(f"Conversion failed: {e}", exc_info=True)
-        raise HTTPException(500, f"Conversion failed: {str(e)}")
+        import traceback
+        tb = traceback.format_exc()
+        logger.error(f"Conversion failed: {e}\n{tb}")
+        raise HTTPException(500, f"Conversion failed: {str(e)}\n\nTraceback:\n{tb[-500:]}")
     finally:
         # Cleanup
         try:
