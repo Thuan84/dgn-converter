@@ -357,18 +357,17 @@ def _format_cadastral_label(labels: list) -> str:
 
 def _cluster_text_points(
     text_points: list,
-    threshold: float = 0.00010,
+    threshold: float = 0.00015,
 ) -> list:
     """Cluster nearby text points into merged cadastral labels.
 
-    Uses grid-based spatial hashing for O(n) performance instead of O(n²).
+    Uses grid-based spatial hashing + BFS chain-linking for O(n) performance.
     """
     if not text_points:
         return []
 
-    # Grid-based clustering: assign each point to a cell
     cell_size = threshold
-    grid: dict = {}  # (cell_x, cell_y) -> list of point indices
+    grid: dict = {}
 
     for idx, pt in enumerate(text_points):
         cx = int(pt['x'] / cell_size)
@@ -378,35 +377,37 @@ def _cluster_text_points(
     used = [False] * len(text_points)
     clusters = []
 
-    for idx, pt in enumerate(text_points):
+    for idx in range(len(text_points)):
         if used[idx]:
             continue
         used[idx] = True
-        cluster = [pt]
+        # BFS queue for chain-linking
+        queue = [idx]
+        cluster_indices = [idx]
+        head = 0
 
-        # Check only neighboring cells (3x3 grid around this point)
-        cx = int(pt['x'] / cell_size)
-        cy = int(pt['y'] / cell_size)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                cell_key = (cx + dx, cy + dy)
-                if cell_key not in grid:
-                    continue
-                for j in grid[cell_key]:
-                    if used[j]:
+        while head < len(queue) and len(cluster_indices) < 5:
+            ci = queue[head]
+            head += 1
+            cpt = text_points[ci]
+            cx = int(cpt['x'] / cell_size)
+            cy = int(cpt['y'] / cell_size)
+
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    cell_key = (cx + dx, cy + dy)
+                    if cell_key not in grid:
                         continue
-                    jpt = text_points[j]
-                    if abs(jpt['x'] - pt['x']) < threshold and abs(jpt['y'] - pt['y']) < threshold:
-                        cluster.append(jpt)
-                        used[j] = True
-                        if len(cluster) >= 5:
-                            break
-                if len(cluster) >= 5:
-                    break
-            if len(cluster) >= 5:
-                break
+                    for j in grid[cell_key]:
+                        if used[j] or len(cluster_indices) >= 5:
+                            continue
+                        jpt = text_points[j]
+                        if abs(jpt['x'] - cpt['x']) < threshold and abs(jpt['y'] - cpt['y']) < threshold:
+                            used[j] = True
+                            queue.append(j)
+                            cluster_indices.append(j)
 
-        # Sort top-to-bottom, collect unique labels
+        cluster = [text_points[i] for i in cluster_indices]
         cluster.sort(key=lambda p: -p['y'])
         seen = []
         for cp in cluster:
