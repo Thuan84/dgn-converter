@@ -648,6 +648,16 @@ def convert_dgn_to_format(
         while feature is not None:
             geom = feature.GetGeometryRef()
             current_text_label = ''  # reset each feature iteration
+
+            # Skip elements on Level 3 (construction/reference lines in cadastral DGN)
+            level_idx = feature.GetDefnRef().GetFieldIndex('Level')
+            if level_idx >= 0:
+                level_val = feature.GetField(level_idx)
+                if level_val is not None and str(level_val).strip() == '3':
+                    feature = src_layer.GetNextFeature()
+                    skipped += 1
+                    continue
+
             if geom is not None:
                 geom_type = geom.GetGeometryType()
 
