@@ -618,6 +618,11 @@ def convert_dgn_to_format(
         feature_count = src_layer.GetFeatureCount()
         logger.info(f"Processing layer '{layer_name}' with {feature_count} features")
 
+        # Debug: log field names for this layer
+        src_defn_dbg = src_layer.GetLayerDefn()
+        field_names = [src_defn_dbg.GetFieldDefn(fi).GetName() for fi in range(src_defn_dbg.GetFieldCount())]
+        logger.info(f"[DEBUG] Layer '{layer_name}' fields: {field_names}")
+
         # Create output layer - force to generic geometry so mixed types work
         out_layer = out_ds.CreateLayer(
             layer_name,
@@ -649,14 +654,23 @@ def convert_dgn_to_format(
             geom = feature.GetGeometryRef()
             current_text_label = ''  # reset each feature iteration
 
-            # Skip elements on Level 3 (construction/reference lines in cadastral DGN)
-            level_idx = feature.GetDefnRef().GetFieldIndex('Level')
-            if level_idx >= 0:
-                level_val = feature.GetField(level_idx)
-                if level_val is not None and str(level_val).strip() == '3':
-                    feature = src_layer.GetNextFeature()
-                    skipped += 1
-                    continue
+            # Skip elements on excluded levels (construction/reference lines)
+            SKIP_LEVELS = {3}
+            feature_level = None
+            for lvl_name in ('Level', 'level', 'LEVEL'):
+                idx = feature.GetDefnRef().GetFieldIndex(lvl_name)
+                if idx >= 0:
+                    val = feature.GetField(idx)
+                    if val is not None:
+                        try:
+                            feature_level = int(val)
+                        except (ValueError, TypeError):
+                            pass
+                    break
+            if feature_level is not None and feature_level in SKIP_LEVELS:
+                feature = src_layer.GetNextFeature()
+                skipped += 1
+                continue
 
             if geom is not None:
                 geom_type = geom.GetGeometryType()
