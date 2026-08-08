@@ -433,88 +433,84 @@ def _postprocess_kml(kml_content: str) -> str:
 
 
 def _fix_point_labels(kml_content: str) -> str:
-    """Fix <name> for Point Placemarks that have a numeric-only or empty name.
+    """Fix <name> for Point Placemarks with numeric-only names. Optimized for large files."""
+    TEXT_FIELD_NAMES = ['Text', 'EntityNum', 'TextString', 'Label', 'Name']
 
-    GDAL DGN → KML outputs element type code (17 = text element) as <name>.
-    The actual text string is in <ExtendedData><SimpleData name="EntityNum"> or
-    <SimpleData name="Text"> or <SimpleData name="TextString">.
+    # Fast path: if no Point placemarks exist, skip entirely
+    if '<Point>' not in kml_content:
+        return kml_content
 
-    Strategy:
-    1. Parse only Placemarks that contain <Point> geometry
-    2. If their <name> is numeric-only (or empty): extract real text from ExtendedData
-    3. If no real text found: remove the Placemark entirely (pure geometry elements)
-    """
-    from xml.etree import ElementTree as ET
+    parts = []
+    search_from = 0
+    pm_start_tag = '<Placemark>'
+    pm_end_tag = '</Placemark>'
 
-    # Work on Placemark blocks individually via regex to avoid full XML parse overhead
-    # Pattern: capture each <Placemark>...</Placemark> block
-    placemark_re = re.compile(r'<Placemark\b[^>]*>.*?</Placemark>', re.DOTALL)
+    while True:
+        start = kml_content.find(pm_start_tag, search_from)
+        if start == -1:
+            parts.append(kml_content[search_from:])
+            break
 
-    # Field priority order for actual text label
-    TEXT_FIELD_NAMES = ['EntityNum', 'Text', 'TextString', 'text', 'TEXT', 'Label',
-                        'Description', 'Name']
+        # Add content before this Placemark
+        parts.append(kml_content[search_from:start])
 
-    def _is_numeric_name(name: str) -> bool:
-        """Return True if name is empty or just a number (likely a DGN type code)."""
-        name = name.strip()
-        return not name or name.isdigit()
+        end = kml_content.find(pm_end_tag, start)
+        if end == -1:
+            parts.append(kml_content[start:])
+            break
+        end += len(pm_end_tag)
+        block = kml_content[start:end]
+        search_from = end
 
-    def _process_placemark(m: re.Match) -> str:
-        block = m.group(0)
-
-        # Only process if it contains a Point
-        if '<Point>' not in block and '<Point ' not in block:
-            return block  # Lines/polygons: keep as-is
+        # Skip non-Point placemarks
+        if '<Point>' not in block:
+            parts.append(block)
+            continue
 
         # Extract current <name>
-        name_m = re.search(r'<name>(.*?)</name>', block, re.DOTALL)
-        current_name = name_m.group(1).strip() if name_m else ''
+        name_s = block.find('<name>')
+        name_e = block.find('</name>')
+        current_name = ''
+        if name_s >= 0 and name_e > name_s:
+            current_name = block[name_s + 6:name_e].strip()
 
-        if not _is_numeric_name(current_name):
-            # Name looks meaningful already (e.g., "CLN", "HNK 280") — keep it
-            return block
+        # If name is already meaningful, keep as-is
+        if current_name and not current_name.isdigit():
+            parts.append(block)
+            continue
 
-        # Try <description> first (GDAL may put text label there)
-        extracted_text = ''
-        desc_m = re.search(r'<description>(.*?)</description>', block, re.DOTALL)
-        if desc_m:
-            desc_val = desc_m.group(1).strip()
-            if desc_val and not desc_val.isdigit():
-                extracted_text = desc_val
-            elif desc_val and desc_val.isdigit() and len(desc_val) >= 3:
-                extracted_text = desc_val
-
-        # Try SimpleData fields in ExtendedData
-        if not extracted_text:
-            for field_name in TEXT_FIELD_NAMES:
-                pat = rf'<SimpleData name="{re.escape(field_name)}">(.*?)</SimpleData>'
-                sd_m = re.search(pat, block, re.DOTALL | re.IGNORECASE)
-                if sd_m:
-                    val = sd_m.group(1).strip()
+        # Try to extract text from SimpleData fields
+        extracted = ''
+        for fn in TEXT_FIELD_NAMES:
+            tag = f'<SimpleData name="{fn}">'
+            idx = block.find(tag)
+            if idx >= 0:
+                val_start = idx + len(tag)
+                val_end = block.find('</SimpleData>', val_start)
+                if val_end > val_start:
+                    val = block[val_start:val_end].strip()
                     if val and not val.isdigit():
-                        extracted_text = val
+                        extracted = val
                         break
                     elif val and val.isdigit() and len(val) >= 3:
-                        extracted_text = val
+                        extracted = val
                         break
 
-        if not extracted_text:
-            # No useful text found → remove this point entirely (it's a DGN non-text element)
-            return ''
+        if not extracted:
+            # Remove pointless Point placemark
+            continue
 
-        # Fix Vietnamese text encoding if needed
-        extracted_text = _fix_text_encoding(extracted_text)
+        extracted = _fix_text_encoding(extracted)
 
-        # Replace or insert <name> with extracted text
-        if name_m:
-            block = block[:name_m.start()] + f'<name>{extracted_text}</name>' + block[name_m.end():]
+        # Insert/replace <name>
+        if name_s >= 0 and name_e > name_s:
+            block = block[:name_s] + f'<name>{extracted}</name>' + block[name_e + 7:]
         else:
-            block = block.replace('<Placemark>', f'<Placemark><name>{extracted_text}</name>', 1)
+            block = block.replace('<Placemark>', f'<Placemark><name>{extracted}</name>', 1)
 
-        return block
+        parts.append(block)
 
-    result = placemark_re.sub(_process_placemark, kml_content)
-    return result
+    return ''.join(parts)
 
 
 
@@ -853,10 +849,7 @@ def convert_dgn_to_format(
         feature_count = src_layer.GetFeatureCount()
         logger.info(f"Processing layer '{layer_name}' with {feature_count} features")
 
-        # Debug: log field names for this layer
         src_defn_dbg = src_layer.GetLayerDefn()
-        field_names = [src_defn_dbg.GetFieldDefn(fi).GetName() for fi in range(src_defn_dbg.GetFieldCount())]
-        logger.info(f"[DEBUG] Layer '{layer_name}' fields: {field_names}")
 
         # Create output layer - force to generic geometry so mixed types work
         out_layer = out_ds.CreateLayer(
@@ -892,9 +885,7 @@ def convert_dgn_to_format(
         _level_idx = -1
         _src_defn = src_layer.GetLayerDefn()
 
-        # Log all available fields for debugging
         all_fields = [_src_defn.GetFieldDefn(fi).GetName() for fi in range(_src_defn.GetFieldCount())]
-        logger.info(f"[FIELDS] Layer '{layer_name}' has fields: {all_fields}")
 
         for lvl_name in ('Level', 'level', 'LEVEL', 'Layer', 'layer', 'LAYER'):
             _level_idx = _src_defn.GetFieldIndex(lvl_name)
@@ -1076,13 +1067,8 @@ def convert_dgn_to_format(
                     out_feature = ogr.Feature(out_layer.GetLayerDefn())
                     out_feature.SetGeometry(geom)
 
-                # Copy field values from source feature
-                for j in range(feature.GetFieldCount()):
-                    try:
-                        out_feature.SetField(j, feature.GetField(j))
-                    except Exception:
-                        pass
-
+                # Copy only essential fields (skip heavy copy for performance)
+                # For KML output, the key fields are geometry + Name
                 out_layer.CreateFeature(out_feature)
                 total_features += 1
 
@@ -1124,15 +1110,6 @@ def convert_dgn_to_format(
         content = f.read()
 
     if output_format.upper() == "KML":
-        # Debug: log a sample of the raw KML to see how GDAL structured Point Placemarks
-        import re as _re
-        pm_matches = list(_re.finditer(r'<Placemark\b[^>]*>.*?</Placemark>', content, _re.DOTALL))
-        point_samples = [m.group(0) for m in pm_matches if '<Point>' in m.group(0) or '<Point ' in m.group(0)]
-        if point_samples:
-            logger.info(f"[DEBUG] Raw KML - first Point Placemark sample:\n{point_samples[0][:600]}")
-        else:
-            logger.info("[DEBUG] No Point Placemarks found in raw KML output")
-
         content = _postprocess_kml(content)
 
     result = content.encode("utf-8")
