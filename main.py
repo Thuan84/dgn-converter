@@ -206,7 +206,7 @@ def health_check():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "2.1.0-tcvn3-dxf-level13"}
 
 
 @app.get("/drivers")
@@ -809,16 +809,22 @@ def convert_dgn_to_format(
         _font_logged = False  # Log detected font once per layer
 
         # Cache level field index (avoid repeated lookup per feature)
-        SKIP_LEVELS = {3, 13}
+        SKIP_LEVELS_INT = {3, 13}
+        SKIP_LAYER_NAMES = {'3', '13'}  # String match for DXF Layer field
         _level_idx = -1
         _src_defn = src_layer.GetLayerDefn()
-        for lvl_name in ('Level', 'level', 'LEVEL', 'layer', 'Layer', 'LAYER'):
+
+        # Log all available fields for debugging
+        all_fields = [_src_defn.GetFieldDefn(fi).GetName() for fi in range(_src_defn.GetFieldCount())]
+        logger.info(f"[FIELDS] Layer '{layer_name}' has fields: {all_fields}")
+
+        for lvl_name in ('Level', 'level', 'LEVEL', 'Layer', 'layer', 'LAYER'):
             _level_idx = _src_defn.GetFieldIndex(lvl_name)
             if _level_idx >= 0:
-                logger.info(f"[LEVEL] Found level field '{lvl_name}' at index {_level_idx}, will skip levels: {SKIP_LEVELS}")
+                logger.info(f"[LEVEL] Found level field '{lvl_name}' at index {_level_idx}, will skip levels: {SKIP_LEVELS_INT}")
                 break
         if _level_idx < 0:
-            logger.warning(f"[LEVEL] No Level/layer field found in layer '{layer_name}' — cannot filter by level")
+            logger.warning(f"[LEVEL] No Level/Layer field found in layer '{layer_name}' — cannot filter by level. Available: {all_fields}")
 
         _level_skip_count = 0
 
@@ -830,17 +836,25 @@ def convert_dgn_to_format(
             if _level_idx >= 0:
                 lv = feature.GetField(_level_idx)
                 if lv is not None:
+                    # Try integer comparison first, then string match
+                    should_skip = False
                     try:
                         lv_int = int(lv) if not isinstance(lv, int) else lv
-                        if lv_int in SKIP_LEVELS:
-                            if _level_skip_count < 3:
-                                logger.info(f"[LEVEL] Skipping feature at Level {lv_int} (type={geom.GetGeometryType() if geom else 'None'})")
-                            _level_skip_count += 1
-                            feature = src_layer.GetNextFeature()
-                            skipped += 1
-                            continue
+                        if lv_int in SKIP_LEVELS_INT:
+                            should_skip = True
                     except (ValueError, TypeError):
-                        pass
+                        # String-based layer name (e.g., "13", "ranh_13")
+                        lv_str = str(lv).strip()
+                        if lv_str in SKIP_LAYER_NAMES:
+                            should_skip = True
+
+                    if should_skip:
+                        if _level_skip_count < 5:
+                            logger.info(f"[LEVEL] Skipping feature at Level/Layer '{lv}' (geom={geom.GetGeometryType() if geom else 'None'})")
+                        _level_skip_count += 1
+                        feature = src_layer.GetNextFeature()
+                        skipped += 1
+                        continue
 
             if geom is not None:
                 geom_type = geom.GetGeometryType()
