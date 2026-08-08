@@ -165,8 +165,21 @@ def _fix_text_encoding(text: str, font_name: str = '') -> str:
     if text.isascii():
         return text
 
+    # Debug: log raw Unicode codepoints for first few non-ASCII texts
+    if not hasattr(_fix_text_encoding, '_debug_count'):
+        _fix_text_encoding._debug_count = 0
+    if _fix_text_encoding._debug_count < 5:
+        codepoints = ' '.join(f'U+{ord(c):04X}' for c in text[:30])
+        logger.info(f"[ENCODING-DEBUG] Raw text codepoints: {codepoints}")
+        logger.info(f"[ENCODING-DEBUG] Text repr: {repr(text[:60])}")
+        logger.info(f"[ENCODING-DEBUG] Font: '{font_name}'")
+        _fix_text_encoding._debug_count += 1
+
+    # Check if text can be encoded as latin-1 (all chars <= U+00FF)
+    can_latin1 = all(ord(c) <= 0xFF for c in text)
+
     # Strategy 0: If font is TCVN3 (.VnTime etc.), use lookup table
-    if _is_tcvn3_font(font_name):
+    if _is_tcvn3_font(font_name) and can_latin1:
         try:
             raw_bytes = text.encode('latin-1')
             result = []
@@ -176,42 +189,58 @@ def _fix_text_encoding(text: str, font_name: str = '') -> str:
                 else:
                     result.append(chr(b))
             return ''.join(result)
+        except (UnicodeDecodeError, UnicodeEncodeError) as e:
+            logger.warning(f"[ENCODING] TCVN3 strategy failed: {e}")
+
+    # Strategy 1: UTF-8 was misread as Latin-1 → reverse it
+    if can_latin1:
+        try:
+            fixed = text.encode('latin-1').decode('utf-8')
+            logger.info(f"[ENCODING] UTF-8 fix: '{text[:30]}' → '{fixed[:30]}'")
+            return fixed
+        except (UnicodeDecodeError, UnicodeEncodeError) as e:
+            logger.debug(f"[ENCODING] UTF-8 strategy failed: {type(e).__name__}")
+
+    # Strategy 2: Windows-1258 (Vietnamese) was misread as Latin-1
+    if can_latin1:
+        try:
+            fixed = text.encode('latin-1').decode('cp1258')
+            logger.info(f"[ENCODING] CP1258 fix: '{text[:30]}' → '{fixed[:30]}'")
+            return fixed
+        except (UnicodeDecodeError, UnicodeEncodeError) as e:
+            logger.debug(f"[ENCODING] CP1258 strategy failed: {type(e).__name__}")
+
+    # Strategy 3: Auto-detect TCVN3 by checking for high-byte patterns
+    if can_latin1:
+        try:
+            raw_bytes = text.encode('latin-1')
+            high_count = sum(1 for b in raw_bytes if 161 <= b <= 255)
+            if high_count > 0 and high_count / len(raw_bytes) > 0.15:
+                result = []
+                for b in raw_bytes:
+                    if b in TCVN3_TO_UNICODE:
+                        result.append(TCVN3_TO_UNICODE[b])
+                    else:
+                        result.append(chr(b))
+                fixed = ''.join(result)
+                vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
+                if any(c in vn_chars for c in fixed.lower()):
+                    return fixed
         except (UnicodeDecodeError, UnicodeEncodeError):
             pass
 
-    # Strategy 1: UTF-8 was misread as Latin-1 → reverse it
-    try:
-        fixed = text.encode('latin-1').decode('utf-8')
-        return fixed
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
+    # Strategy 4: Text contains chars > U+00FF (can't encode as latin-1)
+    # This means GDAL has already decoded with some Unicode awareness
+    # Try to detect if it's a known pattern
+    if not can_latin1:
+        logger.warning(f"[ENCODING] Text contains chars > U+00FF, cannot use latin-1 strategies. First 5 codepoints > 0xFF: {[f'U+{ord(c):04X}' for c in text if ord(c) > 0xFF][:5]}")
+        # The text might already be partially correct Unicode - just return as-is
+        # but clean up any control characters
+        cleaned = ''.join(c if ord(c) >= 32 or c in '\n\r\t' else '' for c in text)
+        if cleaned != text:
+            return cleaned
 
-    # Strategy 2: Windows-1258 (Vietnamese) was misread as Latin-1
-    try:
-        fixed = text.encode('latin-1').decode('cp1258')
-        return fixed
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
-
-    # Strategy 3: Auto-detect TCVN3 by checking for high-byte patterns
-    try:
-        raw_bytes = text.encode('latin-1')
-        high_count = sum(1 for b in raw_bytes if 161 <= b <= 255)
-        if high_count > 0 and high_count / len(raw_bytes) > 0.15:
-            result = []
-            for b in raw_bytes:
-                if b in TCVN3_TO_UNICODE:
-                    result.append(TCVN3_TO_UNICODE[b])
-                else:
-                    result.append(chr(b))
-            fixed = ''.join(result)
-            vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
-            if any(c in vn_chars for c in fixed.lower()):
-                return fixed
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
-
-    # Strategy 4: Try raw bytes interpretation as CP1258
+    # Strategy 5: Try raw bytes interpretation as CP1258
     try:
         raw = text.encode('raw_unicode_escape')
         fixed = raw.decode('cp1258')
