@@ -136,6 +136,17 @@ def _fix_text_encoding(text: str, font_name: str = '') -> str:
     if not text:
         return text
 
+    # Strip BOM (U+FEFF) — DGN V8 files often prepend BOM to text
+    text = text.lstrip('\ufeff')
+    if not text:
+        return text
+
+    # Early check: if text already contains valid Vietnamese Unicode chars,
+    # it's already correct — do NOT re-encode
+    vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđĐ')
+    if any(c in vn_chars for c in text):
+        return text
+
     # Pre-step: Decode OGR percent-encoded text (%XX hex sequences)
     # GDAL StyleString LABEL values may use percent-encoding for special chars
     if '%' in text:
