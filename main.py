@@ -13,6 +13,7 @@ import tempfile
 import logging
 from fastapi import FastAPI, UploadFile, File, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 from osgeo import ogr, osr
 
@@ -24,6 +25,9 @@ app = FastAPI(
     description="Convert MicroStation DGN files to KML/GeoJSON for web map viewing",
     version="1.0.0",
 )
+
+# GZip compression - reduces KML response size by 60-80%
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # CORS - allow frontend to call this API
 app.add_middleware(
