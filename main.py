@@ -38,6 +38,57 @@ app.add_middleware(
 MAX_FILE_SIZE = 15 * 1024 * 1024
 
 
+def _fix_text_encoding(text: str) -> str:
+    """Fix Vietnamese text encoding from DGN V7 files.
+
+    GDAL's DGN V7 driver reads text as raw bytes and interprets them as
+    Latin-1 (ISO-8859-1). If the DGN file was authored on a Vietnamese
+    Windows system, the text is usually UTF-8 or Windows-1258 encoded.
+    This creates double-encoding mojibake when the Latin-1 interpretation
+    is re-encoded as UTF-8 for KML output.
+
+    Examples of mojibake vs correct:
+      'BÃ£o HuyÃ¡Â»â€¡n' → 'Bảo Huyện'
+      'ThÃ  nh phá»' → 'Thành phố'
+
+    Fix strategy:
+    1. Encode corrupted string back to Latin-1 (recovers original bytes)
+    2. Decode bytes as UTF-8 (the true original encoding)
+    3. Fallback: try Windows-1258 (legacy Vietnamese codepage)
+    """
+    if not text:
+        return text
+
+    # Quick check: if text is pure ASCII, no fix needed
+    if text.isascii():
+        return text
+
+    # Strategy 1: UTF-8 was misread as Latin-1 → reverse it
+    try:
+        fixed = text.encode('latin-1').decode('utf-8')
+        return fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    # Strategy 2: Windows-1258 (Vietnamese) was misread as Latin-1
+    try:
+        fixed = text.encode('latin-1').decode('cp1258')
+        return fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    # Strategy 3: Try raw bytes interpretation as CP1258
+    try:
+        raw = text.encode('raw_unicode_escape')
+        fixed = raw.decode('cp1258')
+        if fixed != text:
+            return fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    return text
+
+
 @app.get("/")
 def health_check():
     """Health check endpoint - also keeps Render from sleeping."""
@@ -263,6 +314,9 @@ def _fix_point_labels(kml_content: str) -> str:
         if not extracted_text:
             # No useful text found → remove this point entirely (it's a DGN non-text element)
             return ''
+
+        # Fix Vietnamese text encoding if needed
+        extracted_text = _fix_text_encoding(extracted_text)
 
         # Replace or insert <name> with extracted text
         if name_m:
@@ -702,6 +756,9 @@ def convert_dgn_to_format(
 
 
 
+
+                    # Fix Vietnamese text encoding (GDAL Latin-1 misread)
+                    current_text_label = _fix_text_encoding(current_text_label)
 
                     # Skip if no label
                     if not current_text_label or not current_text_label.strip():
