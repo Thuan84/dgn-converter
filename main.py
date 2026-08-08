@@ -260,7 +260,7 @@ def health_check():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.2.0-keep-text-skip-lines"}
+    return {"status": "ok", "version": "2.3.0-inspect-v2"}
 
 
 @app.get("/drivers")
@@ -312,7 +312,7 @@ async def inspect_dgn(file: UploadFile = File(...)):
             lyr.ResetReading()
             feat = lyr.GetNextFeature()
             checked = 0
-            while feat and checked < 3000 and len(text_samples) < 15:
+            while feat and checked < 500 and len(text_samples) < 10:
                 checked += 1
                 try:
                     style = feat.GetStyleString() or ''
@@ -345,10 +345,8 @@ async def inspect_dgn(file: UploadFile = File(...)):
                     except UnicodeEncodeError:
                         sample["hex"] = "HAS_UNICODE"
                         sample["codepoints"] = [f"U+{ord(c):04X}" for c in raw[:30]]
-                    try:
-                        sample["fixed"] = _fix_text_encoding(raw, font)
-                    except Exception as fe:
-                        sample["fix_err"] = str(fe)
+                    # Skip _fix_text_encoding to avoid timeout
+                    # Just show raw data for debugging
                     text_samples.append(sample)
                 except Exception as e:
                     text_samples.append({"err": str(e)})
