@@ -136,6 +136,31 @@ def _fix_text_encoding(text: str, font_name: str = '') -> str:
     if not text:
         return text
 
+    # Pre-step: Decode OGR percent-encoded text (%XX hex sequences)
+    # GDAL StyleString LABEL values may use percent-encoding for special chars
+    if '%' in text:
+        try:
+            from urllib.parse import unquote
+            decoded = unquote(text, encoding='utf-8')
+            if decoded != text:
+                logger.info(f"[ENCODING] URL-decoded: '{text[:40]}' → '{decoded[:40]}'")
+                text = decoded
+                # After URL-decoding, check if we got valid Vietnamese
+                vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
+                if any(c in vn_chars for c in text.lower()):
+                    return text
+        except Exception:
+            pass
+        # Try latin-1 percent decoding for TCVN3
+        if '%' in text:
+            try:
+                from urllib.parse import unquote
+                decoded_latin = unquote(text, encoding='latin-1')
+                if decoded_latin != text:
+                    text = decoded_latin
+            except Exception:
+                pass
+
     # Quick check: if text is pure ASCII (no high bytes), no fix needed
     if text.isascii():
         return text
