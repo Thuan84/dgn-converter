@@ -225,7 +225,7 @@ def list_drivers():
 
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
-    """Inspect DGN field names and sample values — for debugging label extraction."""
+    """Inspect DGN field names, StyleStrings, and encoding — for debugging label extraction."""
     content = await file.read()
     import tempfile, uuid, os
     tmp_dir = tempfile.mkdtemp()
@@ -235,7 +235,7 @@ async def inspect_dgn(file: UploadFile = File(...)):
         f.write(content)
 
     result = {"layers": []}
-    for drv_name in ["DGNV8", "DGN"]:
+    for drv_name in ["DGNV8", "DGN", "DXF", "CAD"]:
         drv = ogr.GetDriverByName(drv_name)
         if not drv:
             continue
@@ -254,12 +254,12 @@ async def inspect_dgn(file: UploadFile = File(...)):
                 fd = defn.GetFieldDefn(j)
                 fields.append({"name": fd.GetName(), "type": fd.GetTypeName()})
 
-            # Sample first 10 POINT features
+            # Sample first 20 POINT features with full debug info
             samples = []
             lyr.ResetReading()
             feat = lyr.GetNextFeature()
             checked = 0
-            while feat and checked < 200 and len(samples) < 10:
+            while feat and checked < 500 and len(samples) < 20:
                 checked += 1
                 geom = feat.GetGeometryRef()
                 if geom and geom.GetGeometryType() in (ogr.wkbPoint, ogr.wkbPoint25D):
@@ -269,11 +269,53 @@ async def inspect_dgn(file: UploadFile = File(...)):
                             row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
                         except Exception:
                             row[defn.GetFieldDefn(j).GetName()] = None
+
+                    # Add StyleString and encoding debug info
+                    style = feat.GetStyleString() or ''
+                    row['_StyleString'] = style[:200]
+
+                    # Extract raw text from StyleString
+                    raw_text = ''
+                    m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style)
+                    if not m:
+                        m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style)
+                    if m:
+                        raw_text = m.group(1).strip()
+
+                    # Also check Text field
+                    if not raw_text:
+                        for tf in ('Text', 'EntityNum', 'TextString'):
+                            tidx = defn.GetFieldIndex(tf)
+                            if tidx >= 0:
+                                try:
+                                    tv = feat.GetFieldAsString(tidx).strip()
+                                    if tv:
+                                        raw_text = tv
+                                        break
+                                except Exception:
+                                    pass
+
+                    if raw_text:
+                        row['_raw_text'] = raw_text
+                        # Show raw bytes as hex
+                        try:
+                            raw_bytes = raw_text.encode('latin-1')
+                            row['_raw_bytes_hex'] = raw_bytes.hex()
+                        except Exception:
+                            pass
+                        # Detect font
+                        detected_font = _detect_font_from_style(style)
+                        row['_detected_font'] = detected_font
+                        row['_is_tcvn3'] = _is_tcvn3_font(detected_font)
+                        # Show fix result
+                        row['_fixed_text'] = _fix_text_encoding(raw_text, detected_font)
+
                     samples.append(row)
                 feat = lyr.GetNextFeature()
 
             result["layers"].append({
                 "name": lyr.GetName(),
+                "feature_count": lyr.GetFeatureCount(),
                 "fields": fields,
                 "point_samples": samples,
             })
