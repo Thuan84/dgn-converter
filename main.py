@@ -318,7 +318,10 @@ async def inspect_dgn(file: UploadFile = File(...)):
                 checked += 1
                 geom = feat.GetGeometryRef()
                 gt = geom.GetGeometryType() if geom else -1
-                gt_name = ogr.GeometryTypeToName(gt) if gt >= 0 else 'None'
+                try:
+                    gt_name = ogr.GeometryTypeToName(gt) if gt >= 0 else 'None'
+                except Exception:
+                    gt_name = str(gt)
                 geom_type_counts[gt_name] = geom_type_counts.get(gt_name, 0) + 1
 
                 # Check if feature has text content
@@ -334,39 +337,45 @@ async def inspect_dgn(file: UploadFile = File(...)):
                         pass
 
                 if has_label or text_val:
-                    row = {}
-                    for j in range(defn.GetFieldCount()):
-                        try:
-                            row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
-                        except Exception:
-                            row[defn.GetFieldDefn(j).GetName()] = None
+                    try:
+                        row = {}
+                        for j in range(defn.GetFieldCount()):
+                            try:
+                                row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
+                            except Exception:
+                                row[defn.GetFieldDefn(j).GetName()] = None
 
-                    row['_geom_type'] = gt_name
-                    row['_StyleString'] = style[:300]
+                        row['_geom_type'] = gt_name
+                        row['_StyleString'] = style[:300]
 
-                    raw_text = ''
-                    m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style)
-                    if not m:
-                        m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style)
-                    if m:
-                        raw_text = m.group(1).strip()
-                    if not raw_text and text_val:
-                        raw_text = text_val
+                        raw_text = ''
+                        m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style)
+                        if not m:
+                            m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style)
+                        if m:
+                            raw_text = m.group(1).strip()
+                        if not raw_text and text_val:
+                            raw_text = text_val
 
-                    if raw_text:
-                        row['_raw_text'] = raw_text
-                        try:
-                            raw_bytes = raw_text.encode('latin-1')
-                            row['_raw_bytes_hex'] = raw_bytes.hex()
-                        except UnicodeEncodeError:
-                            row['_raw_bytes_hex'] = 'CANNOT_ENCODE_LATIN1'
-                            row['_codepoints'] = ' '.join(f'U+{ord(c):04X}' for c in raw_text[:40])
-                        detected_font = _detect_font_from_style(style)
-                        row['_detected_font'] = detected_font
-                        row['_is_tcvn3'] = _is_tcvn3_font(detected_font)
-                        row['_fixed_text'] = _fix_text_encoding(raw_text, detected_font)
+                        if raw_text:
+                            row['_raw_text'] = raw_text
+                            try:
+                                raw_bytes = raw_text.encode('latin-1')
+                                row['_raw_bytes_hex'] = raw_bytes.hex()
+                            except UnicodeEncodeError:
+                                row['_raw_bytes_hex'] = 'CANNOT_ENCODE_LATIN1'
+                                row['_codepoints'] = ' '.join(f'U+{ord(c):04X}' for c in raw_text[:40])
+                            try:
+                                detected_font = _detect_font_from_style(style)
+                                row['_detected_font'] = detected_font
+                                row['_is_tcvn3'] = _is_tcvn3_font(detected_font)
+                                row['_fixed_text'] = _fix_text_encoding(raw_text, detected_font)
+                            except Exception as enc_err:
+                                row['_encoding_error'] = str(enc_err)
 
-                    text_samples.append(row)
+                        text_samples.append(row)
+                    except Exception as sample_err:
+                        text_samples.append({"_error": str(sample_err)})
                 feat = lyr.GetNextFeature()
 
             result["layers"].append({
