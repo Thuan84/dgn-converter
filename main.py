@@ -279,7 +279,7 @@ def list_drivers():
 
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
-    """Inspect DGN text content for encoding debugging."""
+    """Inspect DGN — dump all text info for encoding debug."""
     try:
         content = await file.read()
         import tempfile as _tf, uuid as _uid, os as _os
@@ -301,57 +301,70 @@ async def inspect_dgn(file: UploadFile = File(...)):
                 break
 
         if not ds:
-            return {"error": "Cannot open file", "layers": []}
+            return {"error": "Cannot open file"}
 
         for i in range(ds.GetLayerCount()):
             lyr = ds.GetLayer(i)
             if not lyr:
                 continue
             defn = lyr.GetLayerDefn()
+
+            # Fast scan: just collect stats and text samples
+            stats = {"has_style": 0, "has_label": 0, "has_text_field": 0, "type_counts": {}}
             text_samples = []
+            first_styles = []  # First 3 non-empty StyleStrings
+
             lyr.ResetReading()
             feat = lyr.GetNextFeature()
-            checked = 0
-            while feat and checked < 500 and len(text_samples) < 10:
-                checked += 1
+            idx = 0
+            while feat:
+                idx += 1
                 try:
+                    # Get Type field (DGN element type)
+                    elem_type = None
+                    ti = defn.GetFieldIndex('Type')
+                    if ti >= 0:
+                        elem_type = feat.GetField(ti)
+                    type_key = str(elem_type)
+                    stats["type_counts"][type_key] = stats["type_counts"].get(type_key, 0) + 1
+
                     style = feat.GetStyleString() or ''
-                    text_field = ''
+                    if style:
+                        stats["has_style"] += 1
+                        if len(first_styles) < 5:
+                            first_styles.append({"idx": idx, "type": elem_type, "style": style[:200]})
+                    if 'LABEL' in style:
+                        stats["has_label"] += 1
+
+                    # Check Text field
+                    text_val = ''
                     tidx = defn.GetFieldIndex('Text')
                     if tidx >= 0:
-                        text_field = (feat.GetFieldAsString(tidx) or '').strip()
-                    if 'LABEL' not in style and not text_field:
-                        feat = lyr.GetNextFeature()
-                        continue
-                    raw = ''
-                    m = re.search(r't:"([^"]*)"', style)
-                    if not m:
-                        m = re.search(r't:([^,)]+)', style)
-                    if m:
-                        raw = m.group(1).strip()
-                    if not raw:
-                        raw = text_field
-                    if not raw:
-                        feat = lyr.GetNextFeature()
-                        continue
-                    font = ''
-                    fm = re.search(r'f:"([^"]*)"', style)
-                    if fm:
-                        font = fm.group(1).strip()
-                    sample = {"text": raw, "font": font, "is_tcvn3": _is_tcvn3_font(font)}
-                    try:
-                        bts = raw.encode('latin-1')
-                        sample["hex"] = bts.hex()
-                    except UnicodeEncodeError:
-                        sample["hex"] = "HAS_UNICODE"
-                        sample["codepoints"] = [f"U+{ord(c):04X}" for c in raw[:30]]
-                    # Skip _fix_text_encoding to avoid timeout
-                    # Just show raw data for debugging
-                    text_samples.append(sample)
-                except Exception as e:
-                    text_samples.append({"err": str(e)})
+                        text_val = (feat.GetFieldAsString(tidx) or '').strip()
+                    if text_val:
+                        stats["has_text_field"] += 1
+
+                    # Collect text samples
+                    if text_val and len(text_samples) < 10:
+                        sample = {"idx": idx, "type": elem_type, "text": text_val}
+                        try:
+                            sample["hex"] = text_val.encode('latin-1').hex()
+                        except UnicodeEncodeError:
+                            sample["codepoints"] = [f"U+{ord(c):04X}" for c in text_val[:20]]
+                        if style:
+                            sample["style_snippet"] = style[:150]
+                        text_samples.append(sample)
+                except Exception:
+                    pass
                 feat = lyr.GetNextFeature()
-            result["layers"].append({"name": lyr.GetName(), "total": lyr.GetFeatureCount(), "checked": checked, "text_samples": text_samples})
+
+            result["layers"].append({
+                "name": lyr.GetName(),
+                "total": idx,
+                "stats": stats,
+                "first_styles": first_styles,
+                "text_samples": text_samples,
+            })
         ds = None
         try:
             _os.remove(tmp_path)
