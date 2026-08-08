@@ -42,30 +42,117 @@ app.add_middleware(
 MAX_FILE_SIZE = 15 * 1024 * 1024
 
 
-def _fix_text_encoding(text: str) -> str:
+# =========================================================================
+# TCVN3 (ABC / .VnTime) → Unicode conversion table
+# Old Vietnamese fonts (.VnTime, .VnArial, .VnTimeH, etc.) use TCVN3
+# encoding where ASCII code points map to Vietnamese glyphs.
+# GDAL reads raw bytes without font awareness → garbled text.
+# =========================================================================
+TCVN3_TO_UNICODE = {
+    # Uppercase base vowels with diacritics
+    161: 'Ă', 162: 'Â', 163: 'Ê', 164: 'Ô', 165: 'Ơ', 166: 'Ư', 167: 'Đ',
+    # Lowercase base vowels with diacritics
+    168: 'ă', 169: 'â', 170: 'ê', 171: 'ô', 172: 'ơ', 173: 'ư', 174: 'đ',
+    # a with tones: à á ả ã ạ
+    181: 'à', 182: 'á', 183: 'ả', 184: 'ã', 185: 'ạ',
+    # ă with tones: ằ ắ ẳ ẵ ặ
+    186: 'ằ', 187: 'ắ', 188: 'ẳ', 189: 'ẵ', 190: 'ặ',
+    # â with tones: ầ ấ ẩ ẫ ậ
+    191: 'ầ', 192: 'ấ', 193: 'ẩ', 194: 'ẫ', 195: 'ậ',
+    # e with tones: è é ẻ ẽ ẹ
+    196: 'è', 197: 'é', 198: 'ẻ', 199: 'ẽ', 200: 'ẹ',
+    # ê with tones: ề ế ể ễ ệ
+    201: 'ề', 202: 'ế', 203: 'ể', 204: 'ễ', 205: 'ệ',
+    # i with tones: ì í ỉ ĩ ị
+    206: 'ì', 207: 'í', 208: 'ỉ', 209: 'ĩ', 210: 'ị',
+    # o with tones: ò ó ỏ õ ọ
+    211: 'ò', 212: 'ó', 213: 'ỏ', 214: 'õ', 215: 'ọ',
+    # ô with tones: ồ ố ổ ỗ ộ
+    216: 'ồ', 217: 'ố', 218: 'ổ', 219: 'ỗ', 220: 'ộ',
+    # ơ with tones: ờ ớ ở ỡ ợ
+    221: 'ờ', 222: 'ớ', 223: 'ở', 224: 'ỡ', 225: 'ợ',
+    # u with tones: ù ú ủ ũ ụ
+    226: 'ù', 227: 'ú', 228: 'ủ', 229: 'ũ', 230: 'ụ',
+    # ư with tones: ừ ứ ử ữ ự
+    231: 'ừ', 232: 'ứ', 233: 'ử', 234: 'ữ', 235: 'ự',
+    # y with tones: ỳ ý ỷ ỹ ỵ
+    236: 'ỳ', 237: 'ý', 238: 'ỷ', 239: 'ỹ', 240: 'ỵ',
+    # Uppercase A with tones
+    241: 'À', 242: 'Á', 243: 'Ả', 244: 'Ã', 245: 'Ạ',
+    246: 'Ằ', 247: 'Ắ', 248: 'Ẳ', 249: 'Ẵ', 250: 'Ặ',
+    251: 'Ầ', 252: 'Ấ', 253: 'Ẩ', 254: 'Ẫ', 255: 'Ậ',
+}
+
+# Font names that use TCVN3 encoding
+TCVN3_FONT_PREFIXES = (
+    '.vn', '.Vn', '.VN',
+    'Vn', 'VN', 'vn',
+    'TCVN', 'tcvn',
+    'VNI', 'vni',
+)
+
+
+def _is_tcvn3_font(font_name: str) -> bool:
+    """Check if a font name is a TCVN3 (ABC) Vietnamese font."""
+    if not font_name:
+        return False
+    fn_clean = font_name.strip().replace(' ', '')
+    for prefix in TCVN3_FONT_PREFIXES:
+        if fn_clean.startswith(prefix):
+            return True
+    return False
+
+
+def _detect_font_from_style(style_str: str) -> str:
+    """Extract font name from OGR StyleString.
+
+    Example: LABEL(f:"VnTimeH",t:"text",...)
+    """
+    if not style_str:
+        return ''
+    m = re.search(r'LABEL\([^)]*\bf:"([^"]*)"', style_str)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'LABEL\([^)]*\bf:([^,)]+)', style_str)
+    if m:
+        return m.group(1).strip()
+    return ''
+
+def _fix_text_encoding(text: str, font_name: str = '') -> str:
     """Fix Vietnamese text encoding from DGN V7 files.
 
     GDAL's DGN V7 driver reads text as raw bytes and interprets them as
-    Latin-1 (ISO-8859-1). If the DGN file was authored on a Vietnamese
-    Windows system, the text is usually UTF-8 or Windows-1258 encoded.
-    This creates double-encoding mojibake when the Latin-1 interpretation
-    is re-encoded as UTF-8 for KML output.
+    Latin-1 (ISO-8859-1). The actual encoding depends on the font used:
 
-    Examples of mojibake vs correct:
-      'BÃ£o HuyÃ¡Â»â€¡n' → 'Bảo Huyện'
-      'ThÃ  nh phá»' → 'Thành phố'
+    1. TCVN3 fonts (.VnTime, .VnArial, etc.) — most common in Vietnamese DGN
+       These use a proprietary character mapping (code points 128-255).
+    2. UTF-8 encoded text — modern DGN files
+    3. Windows-1258 — legacy Vietnamese codepage
 
-    Fix strategy:
-    1. Encode corrupted string back to Latin-1 (recovers original bytes)
-    2. Decode bytes as UTF-8 (the true original encoding)
-    3. Fallback: try Windows-1258 (legacy Vietnamese codepage)
+    Args:
+        text: Raw text from GDAL
+        font_name: Font name from StyleString (used to detect TCVN3)
     """
     if not text:
         return text
 
-    # Quick check: if text is pure ASCII, no fix needed
+    # Quick check: if text is pure ASCII (no high bytes), no fix needed
     if text.isascii():
         return text
+
+    # Strategy 0: If font is TCVN3 (.VnTime etc.), use lookup table
+    if _is_tcvn3_font(font_name):
+        try:
+            raw_bytes = text.encode('latin-1')
+            result = []
+            for b in raw_bytes:
+                if b in TCVN3_TO_UNICODE:
+                    result.append(TCVN3_TO_UNICODE[b])
+                else:
+                    result.append(chr(b))
+            return ''.join(result)
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
 
     # Strategy 1: UTF-8 was misread as Latin-1 → reverse it
     try:
@@ -81,7 +168,25 @@ def _fix_text_encoding(text: str) -> str:
     except (UnicodeDecodeError, UnicodeEncodeError):
         pass
 
-    # Strategy 3: Try raw bytes interpretation as CP1258
+    # Strategy 3: Auto-detect TCVN3 by checking for high-byte patterns
+    try:
+        raw_bytes = text.encode('latin-1')
+        high_count = sum(1 for b in raw_bytes if 161 <= b <= 255)
+        if high_count > 0 and high_count / len(raw_bytes) > 0.15:
+            result = []
+            for b in raw_bytes:
+                if b in TCVN3_TO_UNICODE:
+                    result.append(TCVN3_TO_UNICODE[b])
+                else:
+                    result.append(chr(b))
+            fixed = ''.join(result)
+            vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
+            if any(c in vn_chars for c in fixed.lower()):
+                return fixed
+    except (UnicodeDecodeError, UnicodeEncodeError):
+        pass
+
+    # Strategy 4: Try raw bytes interpretation as CP1258
     try:
         raw = text.encode('raw_unicode_escape')
         fixed = raw.decode('cp1258')
@@ -696,6 +801,7 @@ def convert_dgn_to_format(
 
         # Buffer for text point features — will be clustered before output
         text_point_buffer = []  # list of {'x': float, 'y': float, 'label': str}
+        _font_logged = False  # Log detected font once per layer
 
         # Cache level field index (avoid repeated lookup per feature)
         SKIP_LEVELS = {3, 13}
@@ -737,7 +843,15 @@ def convert_dgn_to_format(
 
                     # PRIMARY: Extract from OGR StyleString
                     style_str = feature.GetStyleString() or ''
+                    detected_font = ''
                     if style_str:
+                        # Detect font for encoding
+                        detected_font = _detect_font_from_style(style_str)
+                        if detected_font and not _font_logged:
+                            is_tcvn = _is_tcvn3_font(detected_font)
+                            logger.info(f"[FONT] Detected font: '{detected_font}' → TCVN3={is_tcvn}")
+                            _font_logged = True
+
                         m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style_str)
                         if not m:
                             m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style_str)
@@ -757,12 +871,8 @@ def convert_dgn_to_format(
                                 except Exception:
                                     pass
 
-
-
-
-
-                    # Fix Vietnamese text encoding (GDAL Latin-1 misread)
-                    current_text_label = _fix_text_encoding(current_text_label)
+                    # Fix Vietnamese text encoding (font-aware: TCVN3 / UTF-8 / CP1258)
+                    current_text_label = _fix_text_encoding(current_text_label, detected_font)
 
                     # Skip if no label
                     if not current_text_label or not current_text_label.strip():
