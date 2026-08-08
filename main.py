@@ -756,10 +756,15 @@ def convert_dgn_to_format(
         ogr.wkbMultiPoint, ogr.wkbMultiPoint25D,
     }
 
-    # Common DGN text field names (GDAL exposes DGN text as these fields)
-    # EntityNum is the GDAL DGN driver field that contains the actual text annotation
-    TEXT_FIELDS = ['EntityNum', 'Text', 'TEXT', 'text', 'Label', 'LABEL', 'TextString',
-                   'Feature_Code', 'Description', 'Name', 'NAME']
+    # Common text field names for DGN and DXF
+    # DGN: EntityNum contains the text annotation
+    # DXF: Text field for TEXT entities, SubClasses may contain MTEXT content
+    TEXT_FIELDS = ['Text', 'TEXT', 'text', 'EntityNum', 'TextString',
+                   'Label', 'LABEL', 'Feature_Code', 'Description',
+                   'Name', 'NAME', 'SubClasses', 'RawCodeValues']
+
+    # Detect file format for format-specific handling
+    _is_dxf = file_ext in ('.dxf',)
 
     for i in range(layer_count):
         src_layer = src_ds.GetLayer(i)
@@ -850,6 +855,20 @@ def convert_dgn_to_format(
                     current_text_label = ''
                     src_defn_scan = src_layer.GetLayerDefn()
 
+                    # DXF debug: log first 5 point features to see what fields are available
+                    if _is_dxf and total_points < 5:
+                        debug_fields = {}
+                        for fi in range(src_defn_scan.GetFieldCount()):
+                            fn = src_defn_scan.GetFieldDefn(fi).GetName()
+                            try:
+                                fv = feature.GetFieldAsString(fi)
+                                if fv:
+                                    debug_fields[fn] = fv[:80]
+                            except Exception:
+                                pass
+                        ss = feature.GetStyleString() or ''
+                        logger.info(f"[DXF-DEBUG] Point #{total_points}: style='{ss[:120]}' fields={debug_fields}")
+
                     # PRIMARY: Extract from OGR StyleString
                     style_str = feature.GetStyleString() or ''
                     detected_font = ''
@@ -904,6 +923,51 @@ def convert_dgn_to_format(
 
                 if coord_transform:
                     geom.Transform(coord_transform)
+
+                # DXF: Check non-point features for text labels (TEXT/MTEXT with non-point geom)
+                if _is_dxf and geom_type not in POINT_TYPES and total_points < MAX_POINT_LABELS:
+                    dxf_text = ''
+                    dxf_style = feature.GetStyleString() or ''
+                    if dxf_style and 'LABEL' in dxf_style:
+                        m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', dxf_style)
+                        if not m:
+                            m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', dxf_style)
+                        if m:
+                            dxf_text = m.group(1).strip()
+
+                    # Also check Text field directly
+                    if not dxf_text:
+                        _dxf_defn = src_layer.GetLayerDefn()
+                        for tf in ('Text', 'TEXT', 'text'):
+                            tidx = _dxf_defn.GetFieldIndex(tf)
+                            if tidx >= 0:
+                                try:
+                                    tv = feature.GetFieldAsString(tidx).strip()
+                                    if tv and tv != '0':
+                                        dxf_text = tv
+                                        break
+                                except Exception:
+                                    pass
+
+                    if dxf_text:
+                        # Fix encoding
+                        dxf_font = _detect_font_from_style(dxf_style) if dxf_style else ''
+                        dxf_text = _fix_text_encoding(dxf_text, dxf_font)
+
+                        if dxf_text.strip():
+                            # Extract centroid for the label position
+                            centroid = geom.Centroid()
+                            if centroid:
+                                text_point_buffer.append({
+                                    'x': centroid.GetX(),
+                                    'y': centroid.GetY(),
+                                    'label': dxf_text,
+                                })
+                                total_points += 1
+                                if total_points <= 3:
+                                    logger.info(f"[DXF-TEXT] Extracted text from non-point (type={geom_type}): '{dxf_text[:50]}'")
+                                # Don't skip — still output the geometry as line/polygon
+                                # The text label is added separately via clustering
 
                 # Convert polygons to their boundary linestrings (no fill!)
                 if geom_type in POLYGON_TYPES:
