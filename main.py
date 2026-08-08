@@ -279,15 +279,15 @@ def list_drivers():
 
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
-    """Inspect DGN text — ultra-minimal to avoid timeout."""
+    """Inspect DGN text — NO GetStyleString to avoid GDAL segfault."""
     try:
         content = await file.read()
-        import tempfile as _tf, uuid as _uid, os as _os
-        tmp_dir = _tf.mkdtemp()
-        ext = _os.path.splitext(file.filename or "test.dgn")[1].lower()
-        tmp_path = _os.path.join(tmp_dir, f"{_uid.uuid4().hex}{ext}")
-        with open(tmp_path, "wb") as fout:
-            fout.write(content)
+        import tempfile, uuid, os
+        tmp_dir = tempfile.mkdtemp()
+        ext = os.path.splitext(file.filename or "test.dgn")[1].lower()
+        tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}{ext}")
+        with open(tmp_path, "wb") as f:
+            f.write(content)
         ds = None
         for dn in ["DGNV8", "DGN", "DXF"]:
             d = ogr.GetDriverByName(dn)
@@ -300,58 +300,57 @@ async def inspect_dgn(file: UploadFile = File(...)):
         lyr = ds.GetLayer(0)
         defn = lyr.GetLayerDefn()
         total = lyr.GetFeatureCount()
-        # Try filter for text elements (Type=17 in DGN)
+        fields = [defn.GetFieldDefn(j).GetName() for j in range(defn.GetFieldCount())]
+        # Filter for Type=17 (text elements in DGN)
         samples = []
-        for type_val in [17, 7, 15]:
-            lyr.SetAttributeFilter(f"Type = {type_val}")
-            lyr.ResetReading()
-            f = lyr.GetNextFeature()
-            count = 0
-            while f and count < 5:
-                count += 1
+        lyr.SetAttributeFilter("Type = 17")
+        lyr.ResetReading()
+        feat = lyr.GetNextFeature()
+        count = 0
+        while feat and count < 10:
+            count += 1
+            row = {}
+            for j in range(defn.GetFieldCount()):
                 try:
-                    txt = ''
-                    ti = defn.GetFieldIndex('Text')
-                    if ti >= 0:
-                        txt = (f.GetFieldAsString(ti) or '').strip()
-                    sty = f.GetStyleString() or ''
-                    lvl = f.GetField(defn.GetFieldIndex('Level')) if defn.GetFieldIndex('Level') >= 0 else None
-                    s = {"type": type_val, "level": lvl, "text_field": txt, "style": sty[:200]}
-                    if txt:
-                        try:
-                            s["hex"] = txt.encode('latin-1').hex()
-                        except UnicodeEncodeError:
-                            s["cp"] = [f"U+{ord(c):04X}" for c in txt[:25]]
-                    samples.append(s)
-                except Exception as e:
-                    samples.append({"type": type_val, "err": str(e)})
-                f = lyr.GetNextFeature()
-        # Also check first 20 features raw
+                    row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
+                except Exception:
+                    pass
+            txt = row.get('Text', '')
+            if txt:
+                try:
+                    row['hex'] = txt.encode('latin-1').hex()
+                except UnicodeEncodeError:
+                    row['codepoints'] = [f"U+{ord(c):04X}" for c in txt[:25]]
+            samples.append(row)
+            feat = lyr.GetNextFeature()
+        # Count Type=17
+        type17_count = count
+        while feat:
+            type17_count += 1
+            feat = lyr.GetNextFeature()
+        # Also get first 10 features (no filter)
         lyr.SetAttributeFilter(None)
         lyr.ResetReading()
-        first20 = []
-        f = lyr.GetNextFeature()
+        first10 = []
+        feat = lyr.GetNextFeature()
         c = 0
-        while f and c < 20:
+        while feat and c < 10:
             c += 1
-            try:
-                tp = f.GetField(defn.GetFieldIndex('Type')) if defn.GetFieldIndex('Type') >= 0 else None
-                txt = ''
-                ti = defn.GetFieldIndex('Text')
-                if ti >= 0:
-                    txt = (f.GetFieldAsString(ti) or '')[:50]
-                sty = (f.GetStyleString() or '')[:100]
-                first20.append({"i": c, "type": tp, "text": txt, "style": sty})
-            except Exception:
-                pass
-            f = lyr.GetNextFeature()
+            row = {}
+            for j in range(defn.GetFieldCount()):
+                try:
+                    row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
+                except Exception:
+                    pass
+            first10.append(row)
+            feat = lyr.GetNextFeature()
         ds = None
         try:
-            _os.remove(tmp_path)
-            _os.rmdir(tmp_dir)
+            os.remove(tmp_path)
+            os.rmdir(tmp_dir)
         except Exception:
             pass
-        return {"total": total, "text_samples": samples, "first20": first20}
+        return {"total": total, "fields": fields, "type17_count": type17_count, "type17_samples": samples, "first10": first10}
     except Exception as e:
         import traceback
         return {"error": str(e), "tb": traceback.format_exc()}
