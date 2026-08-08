@@ -279,123 +279,91 @@ def list_drivers():
 
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
-    """Inspect DGN field names, StyleStrings, and encoding — for debugging label extraction."""
-    content = await file.read()
-    import tempfile, uuid, os
-    tmp_dir = tempfile.mkdtemp()
-    ext = os.path.splitext(file.filename or "test.dgn")[1].lower()
-    tmp_path = os.path.join(tmp_dir, f"{uuid.uuid4().hex}{ext}")
-    with open(tmp_path, "wb") as f:
-        f.write(content)
+    """Inspect DGN text content for encoding debugging."""
+    try:
+        content = await file.read()
+        import tempfile as _tf, uuid as _uid, os as _os
+        tmp_dir = _tf.mkdtemp()
+        ext = _os.path.splitext(file.filename or "test.dgn")[1].lower()
+        tmp_path = _os.path.join(tmp_dir, f"{_uid.uuid4().hex}{ext}")
+        with open(tmp_path, "wb") as fout:
+            fout.write(content)
 
-    result = {"layers": []}
-    for drv_name in ["DGNV8", "DGN", "DXF", "CAD"]:
-        drv = ogr.GetDriverByName(drv_name)
-        if not drv:
-            continue
-        ds = drv.Open(tmp_path, 0)
+        result = {"layers": []}
+        ds = None
+        for drv_name in ["DGNV8", "DGN", "DXF"]:
+            drv = ogr.GetDriverByName(drv_name)
+            if not drv:
+                continue
+            ds = drv.Open(tmp_path, 0)
+            if ds:
+                result["driver_used"] = drv_name
+                break
+
         if not ds:
-            continue
+            return {"error": "Cannot open file", "layers": []}
 
-        result["driver_used"] = drv_name
         for i in range(ds.GetLayerCount()):
             lyr = ds.GetLayer(i)
             if not lyr:
                 continue
             defn = lyr.GetLayerDefn()
-            fields = []
-            for j in range(defn.GetFieldCount()):
-                fd = defn.GetFieldDefn(j)
-                fields.append({"name": fd.GetName(), "type": fd.GetTypeName()})
-
-            # Sample features WITH TEXT — any geometry type
             text_samples = []
-            geom_type_counts = {}
             lyr.ResetReading()
             feat = lyr.GetNextFeature()
             checked = 0
-            while feat and checked < 2000 and len(text_samples) < 15:
+            while feat and checked < 3000 and len(text_samples) < 15:
                 checked += 1
-                geom = feat.GetGeometryRef()
-                gt = geom.GetGeometryType() if geom else -1
                 try:
-                    gt_name = ogr.GeometryTypeToName(gt) if gt >= 0 else 'None'
-                except Exception:
-                    gt_name = str(gt)
-                geom_type_counts[gt_name] = geom_type_counts.get(gt_name, 0) + 1
-
-                # Check if feature has text content
-                style = feat.GetStyleString() or ''
-                has_label = 'LABEL' in style
-
-                text_val = ''
-                tidx = defn.GetFieldIndex('Text')
-                if tidx >= 0:
+                    style = feat.GetStyleString() or ''
+                    text_field = ''
+                    tidx = defn.GetFieldIndex('Text')
+                    if tidx >= 0:
+                        text_field = (feat.GetFieldAsString(tidx) or '').strip()
+                    if 'LABEL' not in style and not text_field:
+                        feat = lyr.GetNextFeature()
+                        continue
+                    raw = ''
+                    m = re.search(r't:"([^"]*)"', style)
+                    if not m:
+                        m = re.search(r't:([^,)]+)', style)
+                    if m:
+                        raw = m.group(1).strip()
+                    if not raw:
+                        raw = text_field
+                    if not raw:
+                        feat = lyr.GetNextFeature()
+                        continue
+                    font = ''
+                    fm = re.search(r'f:"([^"]*)"', style)
+                    if fm:
+                        font = fm.group(1).strip()
+                    sample = {"text": raw, "font": font, "is_tcvn3": _is_tcvn3_font(font)}
                     try:
-                        text_val = (feat.GetFieldAsString(tidx) or '').strip()
-                    except Exception:
-                        pass
-
-                if has_label or text_val:
+                        bts = raw.encode('latin-1')
+                        sample["hex"] = bts.hex()
+                    except UnicodeEncodeError:
+                        sample["hex"] = "HAS_UNICODE"
+                        sample["codepoints"] = [f"U+{ord(c):04X}" for c in raw[:30]]
                     try:
-                        row = {}
-                        for j in range(defn.GetFieldCount()):
-                            try:
-                                row[defn.GetFieldDefn(j).GetName()] = feat.GetField(j)
-                            except Exception:
-                                row[defn.GetFieldDefn(j).GetName()] = None
-
-                        row['_geom_type'] = gt_name
-                        row['_StyleString'] = style[:300]
-
-                        raw_text = ''
-                        m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style)
-                        if not m:
-                            m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style)
-                        if m:
-                            raw_text = m.group(1).strip()
-                        if not raw_text and text_val:
-                            raw_text = text_val
-
-                        if raw_text:
-                            row['_raw_text'] = raw_text
-                            try:
-                                raw_bytes = raw_text.encode('latin-1')
-                                row['_raw_bytes_hex'] = raw_bytes.hex()
-                            except UnicodeEncodeError:
-                                row['_raw_bytes_hex'] = 'CANNOT_ENCODE_LATIN1'
-                                row['_codepoints'] = ' '.join(f'U+{ord(c):04X}' for c in raw_text[:40])
-                            try:
-                                detected_font = _detect_font_from_style(style)
-                                row['_detected_font'] = detected_font
-                                row['_is_tcvn3'] = _is_tcvn3_font(detected_font)
-                                row['_fixed_text'] = _fix_text_encoding(raw_text, detected_font)
-                            except Exception as enc_err:
-                                row['_encoding_error'] = str(enc_err)
-
-                        text_samples.append(row)
-                    except Exception as sample_err:
-                        text_samples.append({"_error": str(sample_err)})
+                        sample["fixed"] = _fix_text_encoding(raw, font)
+                    except Exception as fe:
+                        sample["fix_err"] = str(fe)
+                    text_samples.append(sample)
+                except Exception as e:
+                    text_samples.append({"err": str(e)})
                 feat = lyr.GetNextFeature()
-
-            result["layers"].append({
-                "name": lyr.GetName(),
-                "feature_count": lyr.GetFeatureCount(),
-                "features_checked": checked,
-                "geom_type_counts": geom_type_counts,
-                "fields": fields,
-                "text_samples": text_samples,
-            })
+            result["layers"].append({"name": lyr.GetName(), "total": lyr.GetFeatureCount(), "checked": checked, "text_samples": text_samples})
         ds = None
-        break
-
-    try:
-        os.remove(tmp_path)
-        os.rmdir(tmp_dir)
-    except Exception:
-        pass
-
-    return result
+        try:
+            _os.remove(tmp_path)
+            _os.rmdir(tmp_dir)
+        except Exception:
+            pass
+        return result
+    except Exception as top_err:
+        import traceback
+        return {"error": str(top_err), "tb": traceback.format_exc()}
 
 
 
