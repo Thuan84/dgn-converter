@@ -308,15 +308,32 @@ async def inspect_dgn(file: UploadFile = File(...)):
                 fd = defn.GetFieldDefn(j)
                 fields.append({"name": fd.GetName(), "type": fd.GetTypeName()})
 
-            # Sample first 20 POINT features with full debug info
-            samples = []
+            # Sample features WITH TEXT — any geometry type
+            text_samples = []
+            geom_type_counts = {}
             lyr.ResetReading()
             feat = lyr.GetNextFeature()
             checked = 0
-            while feat and checked < 500 and len(samples) < 20:
+            while feat and checked < 2000 and len(text_samples) < 15:
                 checked += 1
                 geom = feat.GetGeometryRef()
-                if geom and geom.GetGeometryType() in (ogr.wkbPoint, ogr.wkbPoint25D):
+                gt = geom.GetGeometryType() if geom else -1
+                gt_name = ogr.GeometryTypeToName(gt) if gt >= 0 else 'None'
+                geom_type_counts[gt_name] = geom_type_counts.get(gt_name, 0) + 1
+
+                # Check if feature has text content
+                style = feat.GetStyleString() or ''
+                has_label = 'LABEL' in style
+
+                text_val = ''
+                tidx = defn.GetFieldIndex('Text')
+                if tidx >= 0:
+                    try:
+                        text_val = (feat.GetFieldAsString(tidx) or '').strip()
+                    except Exception:
+                        pass
+
+                if has_label or text_val:
                     row = {}
                     for j in range(defn.GetFieldCount()):
                         try:
@@ -324,54 +341,41 @@ async def inspect_dgn(file: UploadFile = File(...)):
                         except Exception:
                             row[defn.GetFieldDefn(j).GetName()] = None
 
-                    # Add StyleString and encoding debug info
-                    style = feat.GetStyleString() or ''
-                    row['_StyleString'] = style[:200]
+                    row['_geom_type'] = gt_name
+                    row['_StyleString'] = style[:300]
 
-                    # Extract raw text from StyleString
                     raw_text = ''
                     m = re.search(r'LABEL\([^)]*\bt:"([^"]*)"', style)
                     if not m:
                         m = re.search(r'LABEL\([^)]*\bt:([^,)]+)', style)
                     if m:
                         raw_text = m.group(1).strip()
-
-                    # Also check Text field
-                    if not raw_text:
-                        for tf in ('Text', 'EntityNum', 'TextString'):
-                            tidx = defn.GetFieldIndex(tf)
-                            if tidx >= 0:
-                                try:
-                                    tv = feat.GetFieldAsString(tidx).strip()
-                                    if tv:
-                                        raw_text = tv
-                                        break
-                                except Exception:
-                                    pass
+                    if not raw_text and text_val:
+                        raw_text = text_val
 
                     if raw_text:
                         row['_raw_text'] = raw_text
-                        # Show raw bytes as hex
                         try:
                             raw_bytes = raw_text.encode('latin-1')
                             row['_raw_bytes_hex'] = raw_bytes.hex()
-                        except Exception:
-                            pass
-                        # Detect font
+                        except UnicodeEncodeError:
+                            row['_raw_bytes_hex'] = 'CANNOT_ENCODE_LATIN1'
+                            row['_codepoints'] = ' '.join(f'U+{ord(c):04X}' for c in raw_text[:40])
                         detected_font = _detect_font_from_style(style)
                         row['_detected_font'] = detected_font
                         row['_is_tcvn3'] = _is_tcvn3_font(detected_font)
-                        # Show fix result
                         row['_fixed_text'] = _fix_text_encoding(raw_text, detected_font)
 
-                    samples.append(row)
+                    text_samples.append(row)
                 feat = lyr.GetNextFeature()
 
             result["layers"].append({
                 "name": lyr.GetName(),
                 "feature_count": lyr.GetFeatureCount(),
+                "features_checked": checked,
+                "geom_type_counts": geom_type_counts,
                 "fields": fields,
-                "point_samples": samples,
+                "text_samples": text_samples,
             })
         ds = None
         break
