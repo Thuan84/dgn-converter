@@ -832,10 +832,14 @@ def convert_dgn_to_format(
             geom = feature.GetGeometryRef()
             current_text_label = ''
 
-            # Fast level check using cached index — skip ALL geometry types at these levels
-            if _level_idx >= 0:
+            # Level/Layer skip — only skip LINE and POLYGON features
+            # KEEP point/text features (they contain parcel labels: crop type, number, area)
+            if _level_idx >= 0 and geom is not None:
                 lv = feature.GetField(_level_idx)
-                if lv is not None:
+                geom_type_check = geom.GetGeometryType()
+                is_point_feature = geom_type_check in POINT_TYPES
+
+                if lv is not None and not is_point_feature:
                     # Try integer comparison first, then string match
                     should_skip = False
                     try:
@@ -843,14 +847,13 @@ def convert_dgn_to_format(
                         if lv_int in SKIP_LEVELS_INT:
                             should_skip = True
                     except (ValueError, TypeError):
-                        # String-based layer name (e.g., "13", "ranh_13")
                         lv_str = str(lv).strip()
                         if lv_str in SKIP_LAYER_NAMES:
                             should_skip = True
 
                     if should_skip:
                         if _level_skip_count < 5:
-                            logger.info(f"[LEVEL] Skipping feature at Level/Layer '{lv}' (geom={geom.GetGeometryType() if geom else 'None'})")
+                            logger.info(f"[LEVEL] Skipping LINE/POLY at Level/Layer '{lv}' (geom={geom_type_check})")
                         _level_skip_count += 1
                         feature = src_layer.GetNextFeature()
                         skipped += 1
