@@ -807,21 +807,30 @@ def convert_dgn_to_format(
         SKIP_LEVELS = {3, 13}
         _level_idx = -1
         _src_defn = src_layer.GetLayerDefn()
-        for lvl_name in ('Level', 'level', 'LEVEL'):
+        for lvl_name in ('Level', 'level', 'LEVEL', 'layer', 'Layer', 'LAYER'):
             _level_idx = _src_defn.GetFieldIndex(lvl_name)
             if _level_idx >= 0:
+                logger.info(f"[LEVEL] Found level field '{lvl_name}' at index {_level_idx}, will skip levels: {SKIP_LEVELS}")
                 break
+        if _level_idx < 0:
+            logger.warning(f"[LEVEL] No Level/layer field found in layer '{layer_name}' — cannot filter by level")
+
+        _level_skip_count = 0
 
         while feature is not None:
             geom = feature.GetGeometryRef()
             current_text_label = ''
 
-            # Fast level check using cached index
+            # Fast level check using cached index — skip ALL geometry types at these levels
             if _level_idx >= 0:
                 lv = feature.GetField(_level_idx)
                 if lv is not None:
                     try:
-                        if int(lv) in SKIP_LEVELS:
+                        lv_int = int(lv) if not isinstance(lv, int) else lv
+                        if lv_int in SKIP_LEVELS:
+                            if _level_skip_count < 3:
+                                logger.info(f"[LEVEL] Skipping feature at Level {lv_int} (type={geom.GetGeometryType() if geom else 'None'})")
+                            _level_skip_count += 1
                             feature = src_layer.GetNextFeature()
                             skipped += 1
                             continue
@@ -946,7 +955,7 @@ def convert_dgn_to_format(
     out_ds = None
     src_ds = None
 
-    logger.info(f"Converted {total_features} features ({total_points} point labels), skipped {skipped} features")
+    logger.info(f"Converted {total_features} features ({total_points} point labels), skipped {skipped} features (level-filtered: {_level_skip_count})")
 
     if total_features == 0:
         raise ValueError("No geometry features found in DGN file.")
