@@ -206,7 +206,7 @@ def health_check():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.1.0-tcvn3-dxf-level13"}
+    return {"status": "ok", "version": "2.2.0-keep-text-skip-lines"}
 
 
 @app.get("/drivers")
