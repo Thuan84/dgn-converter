@@ -279,7 +279,7 @@ def list_drivers():
 
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
-    """Inspect DGN — dump all text info for encoding debug."""
+    """Inspect DGN text — ultra-minimal to avoid timeout."""
     try:
         content = await file.read()
         import tempfile as _tf, uuid as _uid, os as _os
@@ -288,93 +288,73 @@ async def inspect_dgn(file: UploadFile = File(...)):
         tmp_path = _os.path.join(tmp_dir, f"{_uid.uuid4().hex}{ext}")
         with open(tmp_path, "wb") as fout:
             fout.write(content)
-
-        result = {"layers": []}
         ds = None
-        for drv_name in ["DGNV8", "DGN", "DXF"]:
-            drv = ogr.GetDriverByName(drv_name)
-            if not drv:
-                continue
-            ds = drv.Open(tmp_path, 0)
-            if ds:
-                result["driver_used"] = drv_name
-                break
-
+        for dn in ["DGNV8", "DGN", "DXF"]:
+            d = ogr.GetDriverByName(dn)
+            if d:
+                ds = d.Open(tmp_path, 0)
+                if ds:
+                    break
         if not ds:
-            return {"error": "Cannot open file"}
-
-        for i in range(ds.GetLayerCount()):
-            lyr = ds.GetLayer(i)
-            if not lyr:
-                continue
-            defn = lyr.GetLayerDefn()
-
-            # Fast scan: just collect stats and text samples
-            stats = {"has_style": 0, "has_label": 0, "has_text_field": 0, "type_counts": {}}
-            text_samples = []
-            first_styles = []  # First 3 non-empty StyleStrings
-
+            return {"error": "no driver"}
+        lyr = ds.GetLayer(0)
+        defn = lyr.GetLayerDefn()
+        total = lyr.GetFeatureCount()
+        # Try filter for text elements (Type=17 in DGN)
+        samples = []
+        for type_val in [17, 7, 15]:
+            lyr.SetAttributeFilter(f"Type = {type_val}")
             lyr.ResetReading()
-            feat = lyr.GetNextFeature()
-            idx = 0
-            while feat:
-                idx += 1
+            f = lyr.GetNextFeature()
+            count = 0
+            while f and count < 5:
+                count += 1
                 try:
-                    # Get Type field (DGN element type)
-                    elem_type = None
-                    ti = defn.GetFieldIndex('Type')
+                    txt = ''
+                    ti = defn.GetFieldIndex('Text')
                     if ti >= 0:
-                        elem_type = feat.GetField(ti)
-                    type_key = str(elem_type)
-                    stats["type_counts"][type_key] = stats["type_counts"].get(type_key, 0) + 1
-
-                    style = feat.GetStyleString() or ''
-                    if style:
-                        stats["has_style"] += 1
-                        if len(first_styles) < 5:
-                            first_styles.append({"idx": idx, "type": elem_type, "style": style[:200]})
-                    if 'LABEL' in style:
-                        stats["has_label"] += 1
-
-                    # Check Text field
-                    text_val = ''
-                    tidx = defn.GetFieldIndex('Text')
-                    if tidx >= 0:
-                        text_val = (feat.GetFieldAsString(tidx) or '').strip()
-                    if text_val:
-                        stats["has_text_field"] += 1
-
-                    # Collect text samples
-                    if text_val and len(text_samples) < 10:
-                        sample = {"idx": idx, "type": elem_type, "text": text_val}
+                        txt = (f.GetFieldAsString(ti) or '').strip()
+                    sty = f.GetStyleString() or ''
+                    lvl = f.GetField(defn.GetFieldIndex('Level')) if defn.GetFieldIndex('Level') >= 0 else None
+                    s = {"type": type_val, "level": lvl, "text_field": txt, "style": sty[:200]}
+                    if txt:
                         try:
-                            sample["hex"] = text_val.encode('latin-1').hex()
+                            s["hex"] = txt.encode('latin-1').hex()
                         except UnicodeEncodeError:
-                            sample["codepoints"] = [f"U+{ord(c):04X}" for c in text_val[:20]]
-                        if style:
-                            sample["style_snippet"] = style[:150]
-                        text_samples.append(sample)
-                except Exception:
-                    pass
-                feat = lyr.GetNextFeature()
-
-            result["layers"].append({
-                "name": lyr.GetName(),
-                "total": idx,
-                "stats": stats,
-                "first_styles": first_styles,
-                "text_samples": text_samples,
-            })
+                            s["cp"] = [f"U+{ord(c):04X}" for c in txt[:25]]
+                    samples.append(s)
+                except Exception as e:
+                    samples.append({"type": type_val, "err": str(e)})
+                f = lyr.GetNextFeature()
+        # Also check first 20 features raw
+        lyr.SetAttributeFilter(None)
+        lyr.ResetReading()
+        first20 = []
+        f = lyr.GetNextFeature()
+        c = 0
+        while f and c < 20:
+            c += 1
+            try:
+                tp = f.GetField(defn.GetFieldIndex('Type')) if defn.GetFieldIndex('Type') >= 0 else None
+                txt = ''
+                ti = defn.GetFieldIndex('Text')
+                if ti >= 0:
+                    txt = (f.GetFieldAsString(ti) or '')[:50]
+                sty = (f.GetStyleString() or '')[:100]
+                first20.append({"i": c, "type": tp, "text": txt, "style": sty})
+            except Exception:
+                pass
+            f = lyr.GetNextFeature()
         ds = None
         try:
             _os.remove(tmp_path)
             _os.rmdir(tmp_dir)
         except Exception:
             pass
-        return result
-    except Exception as top_err:
+        return {"total": total, "text_samples": samples, "first20": first20}
+    except Exception as e:
         import traceback
-        return {"error": str(top_err), "tb": traceback.format_exc()}
+        return {"error": str(e), "tb": traceback.format_exc()}
 
 
 
