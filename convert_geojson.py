@@ -144,9 +144,46 @@ def convert_dgn_direct_geojson(
             if detected:
                 detected.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
                 coord_transform = osr.CoordinateTransformation(detected, target_srs)
+            else:
+                # DGN/CAD files lack embedded SRS. Check if coordinates are projected VN-2000 meters (> 1000)
+                try:
+                    ext = layer0.GetExtent()  # (minX, maxX, minY, maxY)
+                    if ext and max(abs(ext[0]), abs(ext[1]), abs(ext[2]), abs(ext[3])) > 1000:
+                        northing = (ext[2] + ext[3]) / 2.0
+                        if northing < 800000:
+                            northing = (ext[0] + ext[1]) / 2.0
+                        approx_lat = northing / 110574.0
+                        if 11.0 <= approx_lat <= 12.5:
+                            auto_ktt = 108.25
+                        elif 8.5 <= approx_lat < 11.0:
+                            auto_ktt = 105.75
+                        elif 12.5 < approx_lat <= 16.5:
+                            auto_ktt = 108.00
+                        elif 16.5 < approx_lat <= 19.0:
+                            auto_ktt = 106.50
+                        elif 19.0 < approx_lat <= 23.5:
+                            auto_ktt = 105.00
+                        else:
+                            auto_ktt = 108.25
+
+                        vn2000_proj = (
+                            f'+proj=tmerc +lat_0=0 +lon_0={auto_ktt} +k=0.9999 '
+                            f'+x_0=500000 +y_0=0 +ellps=WGS84 '
+                            f'+towgs84=-191.90441429,-39.30318279,-111.45032835,'
+                            f'-0.00928836,0.01975479,-0.00427372,0.252906278 '
+                            f'+units=m +no_defs'
+                        )
+                        source_srs = osr.SpatialReference()
+                        source_srs.ImportFromProj4(vn2000_proj)
+                        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                        coord_transform = osr.CoordinateTransformation(source_srs, target_srs)
+                        logger.info(f"[AUTO-DETECT] Extent={ext} -> lat={approx_lat:.2f}° -> VN2000 KTT={auto_ktt}°")
+                except Exception as ex:
+                    logger.warning(f"Failed to auto-detect VN2000 projection: {ex}")
 
     # ── Constants ────────────────────────────────────────────────
-    MAX_POINT_LABELS = 5000
+    MAX_BUFFERED_POINTS = 50000
+    MAX_POINT_LABELS = 25000
     POLYGON_TYPES = {
         ogr.wkbPolygon, ogr.wkbPolygon25D,
         ogr.wkbMultiPolygon, ogr.wkbMultiPolygon25D,
@@ -190,6 +227,7 @@ def convert_dgn_direct_geojson(
     geojson_features: list[dict] = []
     total_features = 0
     total_points = 0
+    total_buffered_points = 0
     skipped = 0
     level_skip_count = 0
 
@@ -246,7 +284,7 @@ def convert_dgn_direct_geojson(
 
             # ── Point features: extract text label ───────────────
             if is_point:
-                if total_points >= MAX_POINT_LABELS:
+                if total_buffered_points >= MAX_BUFFERED_POINTS:
                     skipped += 1
                     feature = src_layer.GetNextFeature()
                     continue
@@ -287,7 +325,7 @@ def convert_dgn_direct_geojson(
                     feature = src_layer.GetNextFeature()
                     continue
 
-                total_points += 1
+                total_buffered_points += 1
 
                 # Buffer for clustering
                 pt_geom = geom.Clone()
@@ -309,7 +347,7 @@ def convert_dgn_direct_geojson(
                 geom.Transform(coord_transform)
 
             # DXF: extract text from non-point features
-            if _is_dxf and total_points < MAX_POINT_LABELS:
+            if _is_dxf and total_buffered_points < MAX_BUFFERED_POINTS:
                 dxf_text = ''
                 dxf_style = feature.GetStyleString() or ''
                 if dxf_style and 'LABEL' in dxf_style:
@@ -344,7 +382,7 @@ def convert_dgn_direct_geojson(
                                 'label': dxf_text,
                                 'level': dxf_level,
                             })
-                            total_points += 1
+                            total_buffered_points += 1
 
             # Convert polygon → linestring boundary (no fills)
             if geom_type in POLYGON_TYPES:

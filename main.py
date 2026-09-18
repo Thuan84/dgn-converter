@@ -568,10 +568,13 @@ def _cluster_text_points(
             lvl_key = str(lvl) if lvl is not None else 0
         by_level.setdefault(lvl_key, []).append(pt)
 
+    CADASTRAL_LABEL_LEVELS = {3, 5, 8, 10, 11, 12, 13, 33}
     results: list = []
     for lvl_key, pts in by_level.items():
-        # Only cluster on cadastral plot label levels: Level 5 or Level 33
-        if lvl_key in (5, 33) and len(pts) > 1:
+        # Cadastral plot label levels: Level 13 (standard Famis), Level 5, 33 (gCadas/ViLIS), etc.
+        # Or if the entire file has only 1 level
+        is_cadastral_lvl = (lvl_key in CADASTRAL_LABEL_LEVELS) or (len(by_level) == 1)
+        if is_cadastral_lvl and len(pts) > 1:
             cell_size = threshold
             grid: dict = {}
             for idx, pt in enumerate(pts):
@@ -621,25 +624,30 @@ def _cluster_text_points(
                     if not lbl:
                         continue
                     clean_num = lbl.replace(',', '.')
+                    sub_m = re.match(r'^(\d+)(?:[a-zA-Z]|-[\da-zA-Z]+)?$', clean_num)
                     try:
                         val = float(clean_num)
                         numbers.append((val, lbl, cp))
                     except ValueError:
-                        codes.append(lbl)
+                        if sub_m:
+                            val = float(sub_m.group(1))
+                            numbers.append((val, lbl, cp))
+                        else:
+                            codes.append(lbl)
 
                 # In MicroStation cadastral maps, parcel number is placed above area (higher Y)
                 numbers.sort(key=lambda item: -item[2]['y'])
 
+                codes_unique = list(dict.fromkeys(codes))
+                code_str = '+'.join(codes_unique) if codes_unique else ''
                 if len(numbers) >= 2:
                     parcel = numbers[0][1]
                     area = numbers[1][1]
-                    code_str = '+'.join(codes) if codes else ''
                     label = f"{code_str} {parcel}/{area}".strip()
                 elif len(numbers) == 1:
-                    code_str = '+'.join(codes) if codes else ''
                     label = f"{code_str} {numbers[0][1]}".strip()
                 else:
-                    label = ' '.join(codes)
+                    label = ' '.join(codes_unique)
 
                 cx = sum(c['x'] for c in cluster) / len(cluster)
                 cy = sum(c['y'] for c in cluster) / len(cluster)
@@ -804,12 +812,51 @@ def convert_dgn_to_format(
         if detected_srs:
             detected_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
             coord_transform = osr.CoordinateTransformation(detected_srs, target_srs)
+        else:
+            layer0 = src_ds.GetLayer(0) if src_ds else None
+            if layer0:
+                try:
+                    ext = layer0.GetExtent()
+                    if ext and max(abs(ext[0]), abs(ext[1]), abs(ext[2]), abs(ext[3])) > 1000:
+                        northing = (ext[2] + ext[3]) / 2.0
+                        if northing < 800000:
+                            northing = (ext[0] + ext[1]) / 2.0
+                        approx_lat = northing / 110574.0
+                        if 11.0 <= approx_lat <= 12.5:
+                            auto_ktt = 108.25
+                        elif 8.5 <= approx_lat < 11.0:
+                            auto_ktt = 105.75
+                        elif 12.5 < approx_lat <= 16.5:
+                            auto_ktt = 108.00
+                        elif 16.5 < approx_lat <= 19.0:
+                            auto_ktt = 106.50
+                        elif 19.0 < approx_lat <= 23.5:
+                            auto_ktt = 105.00
+                        else:
+                            auto_ktt = 108.25
+
+                        vn2000_proj = (
+                            f'+proj=tmerc +lat_0=0 +lon_0={auto_ktt} +k=0.9999 '
+                            f'+x_0=500000 +y_0=0 +ellps=WGS84 '
+                            f'+towgs84=-191.90441429,-39.30318279,-111.45032835,'
+                            f'-0.00928836,0.01975479,-0.00427372,0.252906278 '
+                            f'+units=m +no_defs'
+                        )
+                        source_srs = osr.SpatialReference()
+                        source_srs.ImportFromProj4(vn2000_proj)
+                        source_srs.SetAxisMappingStrategy(osr.OAMS_TRADITIONAL_GIS_ORDER)
+                        coord_transform = osr.CoordinateTransformation(source_srs, target_srs)
+                        logger.info(f"[AUTO-DETECT] Extent={ext} -> lat={approx_lat:.2f}° -> VN2000 KTT={auto_ktt}°")
+                except Exception as ex:
+                    logger.warning(f"Failed to auto-detect VN2000 projection: {ex}")
 
     total_features = 0
     skipped = 0
     total_points = 0
+    total_buffered_points = 0
     # Max point labels to avoid crashing browser (DGN cadastral files can have 50k+ points)
-    MAX_POINT_LABELS = 5000
+    MAX_BUFFERED_POINTS = 50000
+    MAX_POINT_LABELS = 25000
 
     # Polygon types that should be converted to linestrings (to avoid fills)
     POLYGON_TYPES = {
@@ -924,7 +971,7 @@ def convert_dgn_to_format(
 
                 # For point features: only keep if there is meaningful text label
                 if geom_type in POINT_TYPES:
-                    if total_points >= MAX_POINT_LABELS:
+                    if total_buffered_points >= MAX_BUFFERED_POINTS:
                         feature = src_layer.GetNextFeature()
                         skipped += 1
                         continue
@@ -985,7 +1032,7 @@ def convert_dgn_to_format(
                         skipped += 1
                         continue
 
-                    total_points += 1
+                    total_buffered_points += 1
 
                 # For point features: buffer them for clustering instead of writing directly
                 if geom_type in POINT_TYPES and current_text_label:
@@ -1003,7 +1050,7 @@ def convert_dgn_to_format(
                     geom.Transform(coord_transform)
 
                 # DXF: Check non-point features for text labels (TEXT/MTEXT with non-point geom)
-                if _is_dxf and geom_type not in POINT_TYPES and total_points < MAX_POINT_LABELS:
+                if _is_dxf and geom_type not in POINT_TYPES and total_buffered_points < MAX_BUFFERED_POINTS:
                     dxf_text = ''
                     dxf_style = feature.GetStyleString() or ''
                     if dxf_style and 'LABEL' in dxf_style:
@@ -1043,7 +1090,7 @@ def convert_dgn_to_format(
                                     'label': dxf_text,
                                     'level': dxf_level,
                                 })
-                                total_points += 1
+                                total_buffered_points += 1
                                 if total_points <= 3:
                                     logger.info(f"[DXF-TEXT] Extracted text from non-point (type={geom_type}): '{dxf_text[:50]}'")
                                 # Don't skip — still output the geometry as line/polygon
