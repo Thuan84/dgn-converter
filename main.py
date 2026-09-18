@@ -16,6 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 from osgeo import ogr, osr
+from convert_geojson import convert_dgn_direct_geojson
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -43,44 +44,40 @@ MAX_FILE_SIZE = 15 * 1024 * 1024
 
 
 # =========================================================================
-# TCVN3 (ABC / .VnTime) → Unicode conversion table
-# Old Vietnamese fonts (.VnTime, .VnArial, .VnTimeH, etc.) use TCVN3
-# encoding where ASCII code points map to Vietnamese glyphs.
-# GDAL reads raw bytes without font awareness → garbled text.
+# TCVN3 (ABC / .VnTime / MstnFont) → Unicode conversion table
+# Old Vietnamese fonts (.VnTime, .VnArial, MstnFont160, VNFONTDC, etc.)
+# use TCVN3 (TCVN 5712:1993) encoding where bytes 0x80-0xFF map to
+# Vietnamese glyphs.
 # =========================================================================
 TCVN3_TO_UNICODE = {
     # Uppercase base vowels with diacritics
-    161: 'Ă', 162: 'Â', 163: 'Ê', 164: 'Ô', 165: 'Ơ', 166: 'Ư', 167: 'Đ',
+    0xa1: 'Ă', 0xa2: 'Â', 0xa3: 'Ê', 0xa4: 'Ô', 0xa5: 'Ơ', 0xa6: 'Ư', 0xa7: 'Đ',
     # Lowercase base vowels with diacritics
-    168: 'ă', 169: 'â', 170: 'ê', 171: 'ô', 172: 'ơ', 173: 'ư', 174: 'đ',
+    0xa8: 'ă', 0xa9: 'â', 0xaa: 'ê', 0xab: 'ô', 0xac: 'ơ', 0xad: 'ư', 0xae: 'đ',
     # a with tones: à á ả ã ạ
-    181: 'à', 182: 'á', 183: 'ả', 184: 'ã', 185: 'ạ',
-    # ă with tones: ằ ắ ẳ ẵ ặ
-    186: 'ằ', 187: 'ắ', 188: 'ẳ', 189: 'ẵ', 190: 'ặ',
-    # â with tones: ầ ấ ẩ ẫ ậ
-    191: 'ầ', 192: 'ấ', 193: 'ẩ', 194: 'ẫ', 195: 'ậ',
+    0xb5: 'à', 0xb6: 'ả', 0xb7: 'ã', 0xb8: 'á', 0xb9: 'ạ',
+    # ă with tones: ằ ẳ ẵ ắ ặ
+    0xbb: 'ằ', 0xbc: 'ẳ', 0xbd: 'ẵ', 0xbe: 'ắ', 0xc6: 'ặ',
+    # â with tones: ầ ẩ ẫ ấ ậ
+    0xc7: 'ầ', 0xc8: 'ẩ', 0xc9: 'ẫ', 0xca: 'ấ', 0xcb: 'ậ',
     # e with tones: è é ẻ ẽ ẹ
-    196: 'è', 197: 'é', 198: 'ẻ', 199: 'ẽ', 200: 'ẹ',
-    # ê with tones: ề ế ể ễ ệ
-    201: 'ề', 202: 'ế', 203: 'ể', 204: 'ễ', 205: 'ệ',
-    # i with tones: ì í ỉ ĩ ị
-    206: 'ì', 207: 'í', 208: 'ỉ', 209: 'ĩ', 210: 'ị',
-    # o with tones: ò ó ỏ õ ọ
-    211: 'ò', 212: 'ó', 213: 'ỏ', 214: 'õ', 215: 'ọ',
-    # ô with tones: ồ ố ổ ỗ ộ
-    216: 'ồ', 217: 'ố', 218: 'ổ', 219: 'ỗ', 220: 'ộ',
-    # ơ with tones: ờ ớ ở ỡ ợ
-    221: 'ờ', 222: 'ớ', 223: 'ở', 224: 'ỡ', 225: 'ợ',
-    # u with tones: ù ú ủ ũ ụ
-    226: 'ù', 227: 'ú', 228: 'ủ', 229: 'ũ', 230: 'ụ',
-    # ư with tones: ừ ứ ử ữ ự
-    231: 'ừ', 232: 'ứ', 233: 'ử', 234: 'ữ', 235: 'ự',
-    # y with tones: ỳ ý ỷ ỹ ỵ
-    236: 'ỳ', 237: 'ý', 238: 'ỷ', 239: 'ỹ', 240: 'ỵ',
-    # Uppercase A with tones
-    241: 'À', 242: 'Á', 243: 'Ả', 244: 'Ã', 245: 'Ạ',
-    246: 'Ằ', 247: 'Ắ', 248: 'Ẳ', 249: 'Ẵ', 250: 'Ặ',
-    251: 'Ầ', 252: 'Ấ', 253: 'Ẩ', 254: 'Ẫ', 255: 'Ậ',
+    0xcc: 'è', 0xcd: 'ẻ', 0xce: 'ẽ', 0xcf: 'é', 0xd0: 'ẹ',
+    # ê with tones: ề ể ễ ế ệ
+    0xd2: 'ề', 0xd3: 'ể', 0xd4: 'ễ', 0xd5: 'ế', 0xd6: 'ệ',
+    # i with tones: ì ỉ ĩ í ị
+    0xd7: 'ì', 0xd8: 'ỉ', 0xdc: 'ĩ', 0xdd: 'í', 0xde: 'ị',
+    # o with tones: ò ỏ õ ó ọ
+    0xdf: 'ò', 0xe1: 'ỏ', 0xe2: 'õ', 0xe3: 'ó', 0xe4: 'ọ',
+    # ô with tones: ồ ổ ỗ ố ộ
+    0xe5: 'ồ', 0xe6: 'ổ', 0xe7: 'ỗ', 0xe8: 'ố', 0xe9: 'ộ',
+    # ơ with tones: ờ ở ỡ ớ ợ
+    0xea: 'ờ', 0xeb: 'ở', 0xec: 'ỡ', 0xed: 'ớ', 0xee: 'ợ',
+    # u with tones: ù ủ ũ ú ụ
+    0xef: 'ù', 0xf1: 'ủ', 0xf2: 'ũ', 0xf3: 'ú', 0xf4: 'ụ',
+    # ư with tones: ừ ử ữ ứ ự
+    0xf5: 'ừ', 0xf6: 'ử', 0xf7: 'ữ', 0xf8: 'ứ', 0xf9: 'ự',
+    # y with tones: ỳ ỷ ỹ ý ỵ
+    0xfa: 'ỳ', 0xfb: 'ỷ', 0xfc: 'ỹ', 0xfd: 'ý', 0xfe: 'ỵ',
 }
 
 # Font names that use TCVN3 encoding
@@ -89,6 +86,7 @@ TCVN3_FONT_PREFIXES = (
     'Vn', 'VN', 'vn',
     'TCVN', 'tcvn',
     'VNI', 'vni',
+    'MstnFont', 'mstnfont',
 )
 
 
@@ -118,147 +116,102 @@ def _detect_font_from_style(style_str: str) -> str:
         return m.group(1).strip()
     return ''
 
+
 def _fix_text_encoding(text: str, font_name: str = '') -> str:
-    """Fix Vietnamese text encoding from DGN V7 files.
+    """Fix Vietnamese text encoding from DGN V7/V8 and CAD files.
 
-    GDAL's DGN V7 driver reads text as raw bytes and interprets them as
-    Latin-1 (ISO-8859-1). The actual encoding depends on the font used:
+    GDAL's DGN V7 driver reads text as raw bytes. For non-UTF-8 bytes,
+    GDAL Python bindings return Python strings with surrogateescape (U+DC00..U+DCFF)
+    or Latin-1 code units.
 
-    1. TCVN3 fonts (.VnTime, .VnArial, etc.) — most common in Vietnamese DGN
-       These use a proprietary character mapping (code points 128-255).
-    2. UTF-8 encoded text — modern DGN files
-    3. Windows-1258 — legacy Vietnamese codepage
-
-    Args:
-        text: Raw text from GDAL
-        font_name: Font name from StyleString (used to detect TCVN3)
+    This function recovers the original byte stream and decodes it using:
+    1. TCVN3 (ABC / MstnFont / .VnTime)
+    2. UTF-8 misread as Latin-1
+    3. Windows-1258
     """
     if not text:
         return text
 
-    # Strip BOM (U+FEFF) — DGN V8 files often prepend BOM to text
+    # Strip BOM (U+FEFF)
     text = text.lstrip('\ufeff')
     if not text:
         return text
 
-    # Early check: if text already contains valid Vietnamese Unicode chars,
-    # it's already correct — do NOT re-encode
-    vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđĐ')
+    # Early check: if text already contains valid Vietnamese Unicode chars, do NOT re-encode
+    vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđĐĂÂÊÔƠƯ')
     if any(c in vn_chars for c in text):
         return text
 
-    # Pre-step: Decode OGR percent-encoded text (%XX hex sequences)
-    # GDAL StyleString LABEL values may use percent-encoding for special chars
+    # Decode OGR percent-encoded text (%XX hex sequences)
     if '%' in text:
         try:
             from urllib.parse import unquote
             decoded = unquote(text, encoding='utf-8')
-            if decoded != text:
-                logger.info(f"[ENCODING] URL-decoded: '{text[:40]}' → '{decoded[:40]}'")
-                text = decoded
-                # After URL-decoding, check if we got valid Vietnamese
-                vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
-                if any(c in vn_chars for c in text.lower()):
-                    return text
+            if decoded != text and any(c in vn_chars for c in decoded):
+                return decoded
+            decoded_latin = unquote(text, encoding='latin-1')
+            if decoded_latin != text:
+                text = decoded_latin
         except Exception:
             pass
-        # Try latin-1 percent decoding for TCVN3
-        if '%' in text:
-            try:
-                from urllib.parse import unquote
-                decoded_latin = unquote(text, encoding='latin-1')
-                if decoded_latin != text:
-                    text = decoded_latin
-            except Exception:
-                pass
 
-    # Quick check: if text is pure ASCII (no high bytes), no fix needed
+    # Pure ASCII without high bytes needs no conversion
     if text.isascii():
         return text
 
-    # Debug: log raw Unicode codepoints for first few non-ASCII texts
-    if not hasattr(_fix_text_encoding, '_debug_count'):
-        _fix_text_encoding._debug_count = 0
-    if _fix_text_encoding._debug_count < 5:
-        codepoints = ' '.join(f'U+{ord(c):04X}' for c in text[:30])
-        logger.info(f"[ENCODING-DEBUG] Raw text codepoints: {codepoints}")
-        logger.info(f"[ENCODING-DEBUG] Text repr: {repr(text[:60])}")
-        logger.info(f"[ENCODING-DEBUG] Font: '{font_name}'")
-        _fix_text_encoding._debug_count += 1
-
-    # Check if text can be encoded as latin-1 (all chars <= U+00FF)
-    can_latin1 = all(ord(c) <= 0xFF for c in text)
-
-    # Strategy 0: If font is TCVN3 (.VnTime etc.), use lookup table
-    if _is_tcvn3_font(font_name) and can_latin1:
+    # Extract raw bytes whether string comes with surrogates (\udcxx) or latin-1
+    has_surrogates = any(0xdc00 <= ord(c) <= 0xdcff for c in text)
+    if has_surrogates:
+        raw_bytes = bytes(
+            (ord(c) - 0xdc00) if (0xdc00 <= ord(c) <= 0xdcff) else ord(c)
+            for c in text
+            if ord(c) < 256 or (0xdc00 <= ord(c) <= 0xdcff)
+        )
+    else:
         try:
             raw_bytes = text.encode('latin-1')
-            result = []
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            raw_bytes = None
+
+    if raw_bytes is not None:
+        # Strategy 1: TCVN3 (ABC) mapping
+        tcvn3_count = sum(1 for b in raw_bytes if b in TCVN3_TO_UNICODE)
+        if tcvn3_count > 0:
+            res = []
             for b in raw_bytes:
                 if b in TCVN3_TO_UNICODE:
-                    result.append(TCVN3_TO_UNICODE[b])
+                    res.append(TCVN3_TO_UNICODE[b])
                 else:
-                    result.append(chr(b))
-            return ''.join(result)
-        except (UnicodeDecodeError, UnicodeEncodeError) as e:
-            logger.warning(f"[ENCODING] TCVN3 strategy failed: {e}")
+                    res.append(chr(b))
+            return ''.join(res)
 
-    # Strategy 1: UTF-8 was misread as Latin-1 → reverse it
-    if can_latin1:
+        # Strategy 2: UTF-8 misread as Latin-1
         try:
-            fixed = text.encode('latin-1').decode('utf-8')
-            logger.info(f"[ENCODING] UTF-8 fix: '{text[:30]}' → '{fixed[:30]}'")
-            return fixed
-        except (UnicodeDecodeError, UnicodeEncodeError) as e:
-            logger.debug(f"[ENCODING] UTF-8 strategy failed: {type(e).__name__}")
-
-    # Strategy 2: Windows-1258 (Vietnamese) was misread as Latin-1
-    if can_latin1:
-        try:
-            fixed = text.encode('latin-1').decode('cp1258')
-            logger.info(f"[ENCODING] CP1258 fix: '{text[:30]}' → '{fixed[:30]}'")
-            return fixed
-        except (UnicodeDecodeError, UnicodeEncodeError) as e:
-            logger.debug(f"[ENCODING] CP1258 strategy failed: {type(e).__name__}")
-
-    # Strategy 3: Auto-detect TCVN3 by checking for high-byte patterns
-    if can_latin1:
-        try:
-            raw_bytes = text.encode('latin-1')
-            high_count = sum(1 for b in raw_bytes if 161 <= b <= 255)
-            if high_count > 0 and high_count / len(raw_bytes) > 0.15:
-                result = []
-                for b in raw_bytes:
-                    if b in TCVN3_TO_UNICODE:
-                        result.append(TCVN3_TO_UNICODE[b])
-                    else:
-                        result.append(chr(b))
-                fixed = ''.join(result)
-                vn_chars = set('àáảãạăắằẳẵặâấầẩẫậèéẻẽẹêếềểễệìíỉĩịòóỏõọôốồổỗộơớờởỡợùúủũụưứừửữựỳýỷỹỵđ')
-                if any(c in vn_chars for c in fixed.lower()):
-                    return fixed
+            fixed = raw_bytes.decode('utf-8')
+            if any(c in vn_chars for c in fixed):
+                return fixed
         except (UnicodeDecodeError, UnicodeEncodeError):
             pass
 
-    # Strategy 4: Text contains chars > U+00FF (can't encode as latin-1)
-    # This means GDAL has already decoded with some Unicode awareness
-    # Try to detect if it's a known pattern
-    if not can_latin1:
-        logger.warning(f"[ENCODING] Text contains chars > U+00FF, cannot use latin-1 strategies. First 5 codepoints > 0xFF: {[f'U+{ord(c):04X}' for c in text if ord(c) > 0xFF][:5]}")
-        # The text might already be partially correct Unicode - just return as-is
-        # but clean up any control characters
-        cleaned = ''.join(c if ord(c) >= 32 or c in '\n\r\t' else '' for c in text)
-        if cleaned != text:
-            return cleaned
+        # Strategy 3: CP1258
+        try:
+            fixed = raw_bytes.decode('cp1258')
+            if any(c in vn_chars for c in fixed):
+                return fixed
+        except (UnicodeDecodeError, UnicodeEncodeError):
+            pass
 
-    # Strategy 5: Try raw bytes interpretation as CP1258
-    try:
-        raw = text.encode('raw_unicode_escape')
-        fixed = raw.decode('cp1258')
-        if fixed != text:
-            return fixed
-    except (UnicodeDecodeError, UnicodeEncodeError):
-        pass
+    # Strategy 4: High code units > 0xFF matching TCVN3 directly
+    tcvn3_hits = sum(1 for c in text if (ord(c) & 0xFF) in TCVN3_TO_UNICODE)
+    if tcvn3_hits > 0:
+        res = []
+        for c in text:
+            b = (ord(c) - 0xdc00) if (0xdc00 <= ord(c) <= 0xdcff) else (ord(c) & 0xFF)
+            if b in TCVN3_TO_UNICODE:
+                res.append(TCVN3_TO_UNICODE[b])
+            else:
+                res.append(c)
+        return ''.join(res)
 
     return text
 
@@ -559,7 +512,7 @@ def _polygon_to_linestring(geom):
 def _format_cadastral_label(labels: list) -> str:
     """Format clustered DGN text labels into single-line cadastral notation.
 
-    Output: "CODE parcel/area" (e.g., "2L 158/708")
+    Output: "CODE parcel/area" (e.g., "ONT+HNK 53/434,0")
     """
     if len(labels) == 1:
         return labels[0]
@@ -578,87 +531,125 @@ def _format_cadastral_label(labels: list) -> str:
             codes.append(label)
 
     if codes and len(numbers) >= 2:
-        numbers.sort(key=lambda x: x[0])
-        code_str = ''.join(codes)
-        return f"{code_str} {numbers[0][1]}/{numbers[-1][1]}"
+        code_str = '+'.join(codes)
+        return f"{code_str} {numbers[0][1]}/{numbers[1][1]}"
 
     if codes and len(numbers) == 1:
-        return f"{''.join(codes)} {numbers[0][1]}"
+        return f"{'+'.join(codes)} {numbers[0][1]}"
 
     if not codes and len(numbers) >= 2:
-        numbers.sort(key=lambda x: x[0])
-        return f"{numbers[0][1]}/{numbers[-1][1]}"
+        return f"{numbers[0][1]}/{numbers[1][1]}"
 
     return ' '.join(labels)
 
 
 def _cluster_text_points(
     text_points: list,
-    threshold: float = 0.00015,
+    threshold: float = 0.00012,
 ) -> list:
     """Cluster nearby text points into merged cadastral labels.
 
-    Uses grid-based spatial hashing + BFS chain-linking for O(n) performance.
+    Grouping is strictly per-level:
+    - Cadastral plot label layers (Level 5 or 33) are clustered so that
+      [crop_type, parcel_num, area] become a single cadastral label: "CODE parcel/area".
+    - Other layers (Level 9 boundary dimensions, Level 13 surrounding plots,
+      Level 28 road/landmark labels, Level 61 notes, etc.) are kept as INDEPENDENT
+      labels with exact locations, avoiding cross-layer corruption.
     """
     if not text_points:
         return []
 
-    cell_size = threshold
-    grid: dict = {}
+    by_level: dict = {}
+    for pt in text_points:
+        lvl = pt.get('level')
+        try:
+            lvl_key = int(lvl) if lvl is not None else 0
+        except (ValueError, TypeError):
+            lvl_key = str(lvl) if lvl is not None else 0
+        by_level.setdefault(lvl_key, []).append(pt)
 
-    for idx, pt in enumerate(text_points):
-        cx = int(pt['x'] / cell_size)
-        cy = int(pt['y'] / cell_size)
-        grid.setdefault((cx, cy), []).append(idx)
+    results: list = []
+    for lvl_key, pts in by_level.items():
+        # Only cluster on cadastral plot label levels: Level 5 or Level 33
+        if lvl_key in (5, 33) and len(pts) > 1:
+            cell_size = threshold
+            grid: dict = {}
+            for idx, pt in enumerate(pts):
+                cx = int(pt['x'] / cell_size)
+                cy = int(pt['y'] / cell_size)
+                grid.setdefault((cx, cy), []).append(idx)
 
-    used = [False] * len(text_points)
-    clusters = []
+            used = [False] * len(pts)
+            for idx in range(len(pts)):
+                if used[idx]:
+                    continue
+                used[idx] = True
+                queue = [idx]
+                c_indices = [idx]
+                head = 0
 
-    for idx in range(len(text_points)):
-        if used[idx]:
-            continue
-        used[idx] = True
-        # BFS queue for chain-linking
-        queue = [idx]
-        cluster_indices = [idx]
-        head = 0
+                while head < len(queue) and len(c_indices) < 5:
+                    ci = queue[head]
+                    head += 1
+                    cpt = pts[ci]
+                    cx = int(cpt['x'] / cell_size)
+                    cy = int(cpt['y'] / cell_size)
 
-        while head < len(queue) and len(cluster_indices) < 5:
-            ci = queue[head]
-            head += 1
-            cpt = text_points[ci]
-            cx = int(cpt['x'] / cell_size)
-            cy = int(cpt['y'] / cell_size)
+                    for dx in (-1, 0, 1):
+                        for dy in (-1, 0, 1):
+                            ckey = (cx + dx, cy + dy)
+                            if ckey not in grid:
+                                continue
+                            for j in grid[ckey]:
+                                if used[j] or len(c_indices) >= 5:
+                                    continue
+                                jpt = pts[j]
+                                if abs(jpt['x'] - cpt['x']) < threshold and abs(jpt['y'] - cpt['y']) < threshold:
+                                    used[j] = True
+                                    queue.append(j)
+                                    c_indices.append(j)
 
-            for dx in (-1, 0, 1):
-                for dy in (-1, 0, 1):
-                    cell_key = (cx + dx, cy + dy)
-                    if cell_key not in grid:
+                cluster = [pts[i] for i in c_indices]
+                if len(cluster) == 1:
+                    results.append(cluster[0])
+                    continue
+
+                codes = []
+                numbers = []
+                for cp in cluster:
+                    lbl = cp['label'].strip()
+                    if not lbl:
                         continue
-                    for j in grid[cell_key]:
-                        if used[j] or len(cluster_indices) >= 5:
-                            continue
-                        jpt = text_points[j]
-                        if abs(jpt['x'] - cpt['x']) < threshold and abs(jpt['y'] - cpt['y']) < threshold:
-                            used[j] = True
-                            queue.append(j)
-                            cluster_indices.append(j)
+                    clean_num = lbl.replace(',', '.')
+                    try:
+                        val = float(clean_num)
+                        numbers.append((val, lbl, cp))
+                    except ValueError:
+                        codes.append(lbl)
 
-        cluster = [text_points[i] for i in cluster_indices]
-        cluster.sort(key=lambda p: -p['y'])
-        seen = []
-        for cp in cluster:
-            lbl = cp['label'].strip()
-            if lbl and lbl not in seen:
-                seen.append(lbl)
+                # In MicroStation cadastral maps, parcel number is placed above area (higher Y)
+                numbers.sort(key=lambda item: -item[2]['y'])
 
-        clusters.append({
-            'x': sum(c['x'] for c in cluster) / len(cluster),
-            'y': sum(c['y'] for c in cluster) / len(cluster),
-            'label': _format_cadastral_label(seen),
-        })
+                if len(numbers) >= 2:
+                    parcel = numbers[0][1]
+                    area = numbers[1][1]
+                    code_str = '+'.join(codes) if codes else ''
+                    label = f"{code_str} {parcel}/{area}".strip()
+                elif len(numbers) == 1:
+                    code_str = '+'.join(codes) if codes else ''
+                    label = f"{code_str} {numbers[0][1]}".strip()
+                else:
+                    label = ' '.join(codes)
 
-    return clusters
+                cx = sum(c['x'] for c in cluster) / len(cluster)
+                cy = sum(c['y'] for c in cluster) / len(cluster)
+                results.append({'x': cx, 'y': cy, 'label': label, 'level': lvl_key})
+        else:
+            # All other levels stay independent (dimensions, neighbor plots, roads, titles)
+            for pt in pts:
+                results.append(pt)
+
+    return results
 
 
 
@@ -1003,7 +994,8 @@ def convert_dgn_to_format(
                         pt_geom.Transform(coord_transform)
                     x = pt_geom.GetX()
                     y = pt_geom.GetY()
-                    text_point_buffer.append({'x': x, 'y': y, 'label': current_text_label})
+                    pt_level = feature.GetField(_level_idx) if _level_idx >= 0 else None
+                    text_point_buffer.append({'x': x, 'y': y, 'label': current_text_label, 'level': pt_level})
                     feature = src_layer.GetNextFeature()
                     continue
 
@@ -1044,10 +1036,12 @@ def convert_dgn_to_format(
                             # Extract centroid for the label position
                             centroid = geom.Centroid()
                             if centroid:
+                                dxf_level = feature.GetField(_level_idx) if _level_idx >= 0 else None
                                 text_point_buffer.append({
                                     'x': centroid.GetX(),
                                     'y': centroid.GetY(),
                                     'label': dxf_text,
+                                    'level': dxf_level,
                                 })
                                 total_points += 1
                                 if total_points <= 3:
@@ -1164,7 +1158,21 @@ async def convert_dgn(
 
         logger.info(f"Converting {file.filename} ({len(content)} bytes) to {format}")
 
-        result = convert_dgn_to_format(input_path, format, source_epsg, central_meridian)
+        if format.upper() == "GEOJSON":
+            # Fast path: direct in-memory GeoJSON (no file I/O, no regex)
+            helpers = {
+                'fix_text_encoding': _fix_text_encoding,
+                'detect_font_from_style': _detect_font_from_style,
+                'is_tcvn3_font': _is_tcvn3_font,
+                'polygon_to_linestring': _polygon_to_linestring,
+                'cluster_text_points': _cluster_text_points,
+            }
+            result = convert_dgn_direct_geojson(
+                input_path, source_epsg, central_meridian, _helpers=helpers
+            )
+        else:
+            # Legacy KML path
+            result = convert_dgn_to_format(input_path, format, source_epsg, central_meridian)
 
         # Determine content type
         if format.upper() == "KML":

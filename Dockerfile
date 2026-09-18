@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy app code
-COPY main.py .
+COPY main.py convert_geojson.py ./
 
 # Expose port
 EXPOSE 10000
