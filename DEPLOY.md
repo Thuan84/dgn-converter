@@ -50,8 +50,14 @@ const DGN_CONVERTER_URL = import.meta.env.VITE_DGN_CONVERTER_URL || 'https://dgn
 ```
 Thay `https://dgn-converter.onrender.com` bằng URL thực tế của bạn.
 
-## Lưu ý
+## Lưu ý & Tối ưu Tốc độ
 
-- **Cold Start**: Gói Free sẽ tự tắt server sau 15 phút không hoạt động. Lần convert đầu tiên sẽ mất 30-60 giây để khởi động lại.
+- **Bộ nhớ đệm IndexedDB (Tức thì 0.1s)**: Ứng dụng đã tích hợp tự động lưu bản đồ đã convert vào IndexedDB trên trình duyệt/thiết bị. Cùng 1 file CAD mở lại sẽ hiển thị tức thì mà không cần gọi server.
+- **Pre-warming thông minh**: Ứng dụng tự động gửi tín hiệu ping đánh thức server ngay khi bạn mở bản đồ hoặc chọn file CAD, giúp giảm thời gian chờ đợi.
+- **Giữ ấm 24/7 bằng Cron miễn phí (Khuyên dùng)**:
+  - Để server Render Free không bao giờ ngủ đông:
+    1. Đăng ký tài khoản miễn phí tại [cron-job.org](https://cron-job.org) hoặc [uptimerobot.com](https://uptimerobot.com).
+    2. Tạo một Job mới ping URL: `https://dgn-converter.onrender.com/health` mỗi 10 phút.
+    3. Hoặc sử dụng GitHub Actions workflow có sẵn tại `.github/workflows/keepalive-dgn.yml`.
 - **File size**: Giới hạn 15MB cho mỗi file DGN upload.
 - **Hệ tọa độ**: Nếu file DGN dùng VN2000, nhớ chọn đúng hệ tọa độ (Múi 3 hoặc Múi 6) khi upload để bản đồ hiển thị đúng vị trí.
