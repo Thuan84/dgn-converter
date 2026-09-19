@@ -224,7 +224,7 @@ def health_check():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "version": "2.3.0-inspect-v2"}
+    return {"status": "ok", "version": "2.4.0-v8-auto", "has_v8_support": True}
 
 
 @app.get("/drivers")
