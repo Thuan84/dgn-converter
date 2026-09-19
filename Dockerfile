@@ -1,9 +1,9 @@
 # Use FULL GDAL image for maximum format support (DGN V7, DGN V8, DXF, DWG...)
 FROM ghcr.io/osgeo/gdal:ubuntu-full-3.9.3
 
-# Install Python and pip
+# Install Python, pip and libgdiplus for Aspose.CAD
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends python3-pip python3-venv && \
+    apt-get install -y --no-install-recommends python3-pip python3-venv libgdiplus && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -13,7 +13,7 @@ COPY requirements.txt .
 RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 # Copy app code
-COPY main.py convert_geojson.py ./
+COPY main.py convert_geojson.py v8_converter.py ./
 
 # Expose port
 EXPOSE 10000

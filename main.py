@@ -241,6 +241,43 @@ def list_drivers():
     return {"drivers": sorted(drivers), "dgn_support": dgn_support, "total": len(drivers)}
 
 
+@app.post("/detect")
+async def detect_file_format(file: UploadFile = File(...)):
+    """Detect format and version of uploaded CAD/DGN file directly from header bytes."""
+    header = await file.read(16)
+    filename = file.filename or "unknown"
+    ext = os.path.splitext(filename)[1].lower()
+
+    is_dgn_v8 = False
+    is_dgn_v7 = False
+    format_name = "UNKNOWN"
+
+    if len(header) >= 4 and header[:4] == b'\xd0\xcf\x11\xe0':
+        is_dgn_v8 = True
+        format_name = "DGN V8 (MicroStation V8/V8i/CONNECT OLE2)"
+    elif ext == '.dgn':
+        is_dgn_v7 = True
+        format_name = "DGN V7 (MicroStation SE/J ISFF)"
+    elif ext == '.dxf':
+        format_name = "AutoCAD DXF"
+    elif ext == '.dwg':
+        format_name = "AutoCAD DWG"
+
+    return {
+        "filename": filename,
+        "format": format_name,
+        "is_dgn_v8": is_dgn_v8,
+        "is_dgn_v7": is_dgn_v7,
+        "magic_hex": header[:8].hex() if header else "",
+        "recommendation": (
+            "File DGN V8: Vui lòng mở trong MicroStation/AutoCAD và xuất sang định dạng DXF để mở tức thì 0.05s offline trên ứng dụng."
+            if is_dgn_v8 else "Định dạng sẵn sàng chuyển đổi."
+        )
+    }
+
+
+
+
 @app.post("/inspect")
 async def inspect_dgn(file: UploadFile = File(...)):
     """Inspect DGN text — NO GetStyleString to avoid GDAL segfault."""
@@ -709,6 +746,22 @@ def convert_dgn_to_format(
                 if src_ds is not None:
                     logger.info(f"Opened with driver: {driver_name_try}")
                     break
+
+        # Fallback for DGN V8: Auto-convert to intermediate DXF via Aspose.CAD
+        if src_ds is None and "V8" in (file_format_info or ""):
+            logger.info("[DGN V8] Attempting silent auto-convert to DXF via Aspose.CAD...")
+            try:
+                from v8_converter import convert_dgn_v8_to_dxf
+                temp_dxf = input_path + f".v8_temp_{os.getpid()}.dxf"
+                if convert_dgn_v8_to_dxf(input_path, temp_dxf):
+                    dxf_drv = ogr.GetDriverByName("DXF")
+                    if dxf_drv:
+                        src_ds = dxf_drv.Open(temp_dxf, 0)
+                        if src_ds:
+                            logger.info(f"[DGN V8] Successfully auto-converted and opened as DXF ({temp_dxf})")
+            except Exception as v8_ex:
+                logger.warning(f"[DGN V8] Aspose.CAD auto-convert failed: {v8_ex}")
+
     elif file_ext in ('.dxf',):
         drv = ogr.GetDriverByName("DXF")
         if drv:
@@ -743,7 +796,7 @@ def convert_dgn_to_format(
 
         if file_ext == '.dgn' and 'V8' in (file_format_info or ''):
             raise ValueError(
-                f"File DGN V8 không được hỗ trợ trực tiếp. "
+                f"File DGN V8 không thể chuyển đổi tự động do thiếu thư viện. "
                 f"Vui lòng mở file trong MicroStation → File → Save As → "
                 f"chọn định dạng DXF hoặc DGN V7 → upload lại file mới."
             )

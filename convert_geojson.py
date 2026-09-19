@@ -47,20 +47,24 @@ def convert_dgn_direct_geojson(
     _cluster_text_points = h.get('cluster_text_points', lambda pts: pts)
 
     # ── Open file ────────────────────────────────────────────────
+    # ── Open file ────────────────────────────────────────────────
     src_ds = None
     tried_drivers = []
     file_ext = os.path.splitext(input_path)[1].lower()
+    temp_files_to_clean: list[str] = []
+    is_converted_dxf = False
 
     if file_ext == '.dgn':
         file_format_info = ""
+        is_v8 = False
         try:
             with open(input_path, "rb") as f:
                 header = f.read(16)
-            if len(header) >= 4:
-                if header[:4] == b'\xd0\xcf\x11\xe0':
-                    file_format_info = "DGN V8 (OLE2)"
-                else:
-                    file_format_info = "DGN V7"
+            if len(header) >= 4 and header[:4] == b'\xd0\xcf\x11\xe0':
+                file_format_info = "DGN V8 (OLE2)"
+                is_v8 = True
+            else:
+                file_format_info = "DGN V7"
             logger.info(f"File format: {file_format_info}")
         except Exception:
             file_format_info = ""
@@ -73,6 +77,23 @@ def convert_dgn_direct_geojson(
                 if src_ds:
                     logger.info(f"Opened with {dn}")
                     break
+
+        # Fallback for DGN V8: Auto-convert to intermediate DXF via Aspose.CAD
+        if src_ds is None and is_v8:
+            logger.info("[DGN V8] Attempting silent auto-convert to DXF via Aspose.CAD...")
+            try:
+                from v8_converter import convert_dgn_v8_to_dxf
+                temp_dxf = input_path + f".v8_temp_{os.getpid()}.dxf"
+                if convert_dgn_v8_to_dxf(input_path, temp_dxf):
+                    dxf_drv = ogr.GetDriverByName("DXF")
+                    if dxf_drv:
+                        src_ds = dxf_drv.Open(temp_dxf, 0)
+                        if src_ds:
+                            is_converted_dxf = True
+                            temp_files_to_clean.append(temp_dxf)
+                            logger.info(f"[DGN V8] Successfully auto-converted and opened as DXF ({temp_dxf})")
+            except Exception as v8_ex:
+                logger.warning(f"[DGN V8] Aspose.CAD auto-convert failed: {v8_ex}")
 
     elif file_ext == '.dxf':
         drv = ogr.GetDriverByName("DXF")
@@ -101,7 +122,7 @@ def convert_dgn_direct_geojson(
     if src_ds is None:
         if file_ext == '.dgn' and 'V8' in (file_format_info or ''):
             raise ValueError(
-                "File DGN V8 không được hỗ trợ. Vui lòng chuyển sang DXF hoặc DGN V7."
+                "File DGN V8 không thể chuyển đổi tự động do thiếu thư viện. Vui lòng chuyển sang DXF hoặc DGN V7."
             )
         raise ValueError(
             f"Cannot open file. Tried: [{', '.join(tried_drivers)}]"
@@ -112,6 +133,7 @@ def convert_dgn_direct_geojson(
         raise ValueError("File contains no layers.")
 
     logger.info(f"File has {layer_count} layer(s)")
+
 
     # ── Coordinate transform ─────────────────────────────────────
     target_srs = osr.SpatialReference()
@@ -200,7 +222,7 @@ def convert_dgn_direct_geojson(
     SKIP_LEVELS_INT = {3, 13}
     SKIP_LAYER_NAMES = {'3', '13'}
 
-    _is_dxf = file_ext == '.dxf'
+    _is_dxf = file_ext == '.dxf' or is_converted_dxf
     _label_regex_1 = re.compile(r'LABEL\([^)]*\bt:"([^"]*)"')
     _label_regex_2 = re.compile(r'LABEL\([^)]*\bt:([^,)]+)')
     _garbage_re = re.compile(
@@ -432,6 +454,12 @@ def convert_dgn_direct_geojson(
                 total_points += 1
 
     src_ds = None
+    for tf in temp_files_to_clean:
+        try:
+            if os.path.exists(tf):
+                os.remove(tf)
+        except Exception:
+            pass
 
     logger.info(
         f"Direct GeoJSON: {total_features} features "

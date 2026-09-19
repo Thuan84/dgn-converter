@@ -2,3 +2,5 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.0
 python-multipart==0.0.9
 GDAL==3.9.3
+aspose-cad>=24.0.0
+
